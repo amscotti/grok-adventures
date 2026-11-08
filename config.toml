@@ -1,0 +1,78 @@
+# Grok Adventures Configuration
+#
+# CLI overrides (session only):
+#   --name / -n     character name (skips minimal-mode name prompt)
+#   --load SLOT     load saves/SLOT.json
+#   --minimal       linear block UI
+#   --fullscreen    ratatui sticky status + scrollback
+#   --autopilot             AI player stress test (minimal UI)
+#   --scripted-autopilot    fixed action rotation (no second model)
+#   --player-style STYLE    cautious | balanced | reckless (autopilot agent)
+#   --turns N               autopilot turn cap
+#   --no-tts                disable DM speech
+#   --no-stt                disable push-to-talk
+#   --config PATH           this file (default config.toml)
+#
+# Env: XAI_API_KEY (preferred), XAI_MODEL, XAI_PLAYER_MODEL,
+#      XAI_REASONING_EFFORT (low|medium|high|xhigh), XAI_STT_MODEL,
+#      GROK_ADVENTURES_PLAYER_STYLE, GROK_ADVENTURES_SCRIPTED_AUTOPILOT=1,
+#      GROK_ADVENTURES_DEBUG=1, NO_COLOR
+
+[xai]
+api_key = ""  # Set via XAI_API_KEY env var or here
+# Latest Grok. Override with XAI_MODEL / XAI_PLAYER_MODEL.
+model = "grok-4.7"
+player_model = "grok-4.7"
+# low keeps tool turns snappy. The API default is high.
+reasoning_effort = "low"
+
+[ui]
+# fullscreen = ratatui TUI; minimal = linear block print
+mode = "minimal"          # minimal | fullscreen
+theme = "groknight"       # groknight | grokday | auto
+compact = false
+tools_expanded = false    # collapse tool groups by default
+show_shortcuts = true
+
+[voice]
+# Player input: typing is always on. STT is optional:
+#   minimal mode: `talk` (record until Enter)
+#   fullscreen:   hold F2 to talk, release to send (or `talk`)
+enable_stt = true
+# Insert transcript into the prompt for editing (true) vs auto-submit (false)
+stt_edit_before_send = true
+# DM output speech (independent of whether the player typed or spoke)
+enable_tts = true
+# DM voice — options: zagan (dramatic), orion (cinematic), luna (gentle),
+#   eve (energetic), rigel (precise professional)
+dm_voice = "zagan"
+# Narration voice for NPCs — can change per-NPC
+narrator_voice = "orion"
+
+[game]
+# Tone: "dark_fantasy", "heroic", "comedic", "custom"
+tone = "heroic"
+# Dice system: "dnd5e", "simple", "custom"
+ruleset = "dnd5e"
+# Prior player/DM exchanges kept as chat messages (0 = state+log only)
+history_turns = 8
+
+[tts]
+# Output format: "mp3", "wav", "pcm"
+format = "mp3"
+
+[stt]
+# Latest xAI transcription model. Override with XAI_STT_MODEL.
+model = "grok-voice-transcribe-2.0"
+# Language for formatted transcripts (format=true is always sent).
+language = "en"
+# Show words while you speak. false = upload the clip after you stop.
+streaming = true
+# Recording device index (-1 for default)
+device = -1
+# Sample rate
+sample_rate = 16000
+# Default push-to-talk / fixed record length (seconds)
+record_seconds = 12
+# Hard cap for Enter-to-stop (minimal) and F2 hold (fullscreen)
+max_record_seconds = 60
