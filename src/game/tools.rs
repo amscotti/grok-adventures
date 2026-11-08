@@ -6,8 +6,18 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::game::state::GameState;
+use crate::game::state::{GameState, MAX_COMBAT_PARTICIPANTS, MAX_ITEM_QUANTITY};
 use crate::util::dice;
+
+/// Largest HP change a single tool call may request.
+const MAX_HP_DELTA: i64 = 1_000_000;
+
+/// Largest roll modifier (before the ability modifier) a tool call may request.
+const MAX_ROLL_MODIFIER: i64 = 1_000;
+
+/// Plausible range for a character ability score.
+const MIN_ABILITY_SCORE: i32 = 1;
+const MAX_ABILITY_SCORE: i32 = 100;
 
 /// Tools that mutate authoritative state. When any of these ran this turn,
 /// marker fallback is skipped to avoid double-counting.
@@ -23,6 +33,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "start_combat",
     "advance_turn",
     "end_combat",
+    "set_objective",
 ];
 
 /// All tool names for reference / tests.
@@ -45,6 +56,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "start_combat",
     "advance_turn",
     "end_combat",
+    "set_objective",
 ];
 
 /// Whether `name` is a state-mutating tool.
@@ -349,23 +361,92 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             json!({}),
             &[],
         ),
+        tool(
+            "set_objective",
+            "Set or complete the campaign's authoritative objective and \
+             escalating threat. Call this at the opening and again whenever \
+             the goal or threat materially changes, so state and narration \
+             stay in sync. Set complete=true only when the objective is \
+             truly resolved; then narrate the epilogue.",
+            json!({
+                "objective": {
+                    "type": "string",
+                    "description": "Current objective (required unless complete=true; max 500 chars)"
+                },
+                "threat": {
+                    "type": "string",
+                    "description": "Escalating threat or clock (optional; empty clears it; max 300 chars)"
+                },
+                "complete": {
+                    "type": "boolean",
+                    "description": "True to clear the objective and threat because the objective is resolved (default: false)"
+                }
+            }),
+            &[],
+        ),
     ]
 }
 
-fn arg_i64(args: &Value, key: &str) -> Option<i64> {
-    args.get(key).and_then(|v| {
-        v.as_i64()
-            .or_else(|| v.as_f64().map(|f| f as i64))
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
+/// Parse an optional integer argument strictly.
+///
+/// Accepts JSON integers and integer strings; rejects fractional numbers,
+/// non-numeric strings, booleans, and values outside `i64`.
+fn parse_int_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = value.as_i64() {
+        return Ok(Some(n));
+    }
+    if let Some(n) = value.as_u64() {
+        return i64::try_from(n)
+            .map(Some)
+            .map_err(|_| format!("Parameter '{key}' is out of range"));
+    }
+    if let Some(f) = value.as_f64() {
+        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Ok(Some(f as i64));
+        }
+        return Err(format!("Parameter '{key}' must be an integer"));
+    }
+    if let Some(s) = value.as_str() {
+        return s
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("Parameter '{key}' must be an integer"));
+    }
+    Err(format!("Parameter '{key}' must be an integer"))
 }
 
-fn arg_u32(args: &Value, key: &str) -> Option<u32> {
-    arg_i64(args, key).and_then(|n| u32::try_from(n).ok())
+/// Optional integer argument constrained to an inclusive range.
+fn int_arg(args: &Value, key: &str, min: i64, max: i64) -> Result<Option<i64>, ToolResult> {
+    match parse_int_arg(args, key) {
+        Ok(Some(n)) if (min..=max).contains(&n) => Ok(Some(n)),
+        Ok(Some(n)) => Err(ToolResult::err(format!(
+            "Parameter '{key}' must be between {min} and {max} (got {n})"
+        ))),
+        Ok(None) => Ok(None),
+        Err(message) => Err(ToolResult::err(message)),
+    }
 }
 
-fn arg_i32(args: &Value, key: &str) -> Option<i32> {
-    arg_i64(args, key).and_then(|n| i32::try_from(n).ok())
+fn i32_arg(args: &Value, key: &str, min: i64, max: i64) -> Result<Option<i32>, ToolResult> {
+    int_arg(args, key, min, max).map(|value| value.map(|n| n as i32))
+}
+
+/// Optional boolean argument (defaults to `false` when absent or null).
+fn bool_arg(args: &Value, key: &str) -> Result<bool, ToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ToolResult::err(format!(
+            "Parameter '{key}' must be a boolean"
+        ))),
+    }
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -399,16 +480,27 @@ pub fn dispatch(state: &mut GameState, name: &str, args: &Value) -> ToolResult {
         "start_combat" => dispatch_start_combat(state, args),
         "advance_turn" => dispatch_advance_turn(state),
         "end_combat" => dispatch_end_combat(state),
+        "set_objective" => dispatch_set_objective(state, args),
         other => ToolResult::err(format!("Unknown tool: {other}")),
     }
 }
 
 fn dispatch_roll_dice(state: &GameState, args: &Value) -> ToolResult {
-    let Some(sides) = arg_u32(args, "sides") else {
-        return missing("sides");
+    let sides = match int_arg(args, "sides", 0, i64::from(u32::MAX)) {
+        Ok(Some(n)) => n as u32,
+        Ok(None) => return missing("sides"),
+        Err(e) => return e,
     };
-    let count = arg_u32(args, "count").unwrap_or(1);
-    let explicit_mod = arg_i32(args, "modifier").unwrap_or(0);
+    let count = match int_arg(args, "count", 1, 10) {
+        Ok(Some(n)) => n as u32,
+        Ok(None) => 1,
+        Err(e) => return e,
+    };
+    let explicit_mod = match i32_arg(args, "modifier", -MAX_ROLL_MODIFIER, MAX_ROLL_MODIFIER) {
+        Ok(Some(n)) => n,
+        Ok(None) => 0,
+        Err(e) => return e,
+    };
 
     let mut ability_note = String::new();
     let mut ability_mod = 0i32;
@@ -425,11 +517,17 @@ fn dispatch_roll_dice(state: &GameState, args: &Value) -> ToolResult {
         let Some(&score) = state.stats.get(&ability) else {
             return ToolResult::err(format!("Character has no {ability} score."));
         };
+        if !(MIN_ABILITY_SCORE..=MAX_ABILITY_SCORE).contains(&score) {
+            return ToolResult::err(format!(
+                "Character has invalid {ability} score ({score}); expected \
+                 {MIN_ABILITY_SCORE}-{MAX_ABILITY_SCORE}."
+            ));
+        }
         ability_mod = dice::ability_modifier(score);
         ability_note = format!(" [{ability} {score} → {ability_mod:+}]");
     }
 
-    let modifier = explicit_mod + ability_mod;
+    let modifier = explicit_mod.saturating_add(ability_mod);
 
     match dice::roll(sides, count, modifier) {
         Ok(roll) => {
@@ -487,8 +585,10 @@ fn dispatch_get_character_stats(state: &GameState) -> ToolResult {
 }
 
 fn dispatch_modify_hp(state: &mut GameState, args: &Value) -> ToolResult {
-    let Some(amount) = arg_i32(args, "amount") else {
-        return missing("amount");
+    let amount = match i32_arg(args, "amount", -MAX_HP_DELTA, MAX_HP_DELTA) {
+        Ok(Some(n)) => n,
+        Ok(None) => return missing("amount"),
+        Err(e) => return e,
     };
     let mut result = state.modify_hp(amount);
     if !state.alive() {
@@ -504,10 +604,18 @@ fn dispatch_start_combat(state: &mut GameState, args: &Value) -> ToolResult {
     let Some(arr) = args.get("participants").and_then(|v| v.as_array()) else {
         return missing("participants");
     };
-    let participants: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
+    if arr.len() > MAX_COMBAT_PARTICIPANTS {
+        return ToolResult::err(format!(
+            "Parameter 'participants' may contain at most {MAX_COMBAT_PARTICIPANTS} names"
+        ));
+    }
+    let mut participants = Vec::with_capacity(arr.len());
+    for value in arr {
+        let Some(name) = value.as_str() else {
+            return ToolResult::err("Parameter 'participants' must be an array of strings");
+        };
+        participants.push(name.to_string());
+    }
     let result = state.start_combat(participants);
     if result.starts_with("Cannot") {
         ToolResult::err(format!("❌ {result}"))
@@ -534,6 +642,33 @@ fn dispatch_end_combat(state: &mut GameState) -> ToolResult {
     }
 }
 
+fn dispatch_set_objective(state: &mut GameState, args: &Value) -> ToolResult {
+    let complete = match bool_arg(args, "complete") {
+        Ok(complete) => complete,
+        Err(e) => return e,
+    };
+    if complete {
+        return ToolResult::ok(format!("🏁 {}", state.complete_objective()));
+    }
+
+    let Some(objective) = args.get("objective") else {
+        return missing("objective");
+    };
+    let Some(objective) = objective.as_str() else {
+        return ToolResult::err("Parameter 'objective' must be a string");
+    };
+    let threat = match args.get("threat") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(threat)) => Some(threat.as_str()),
+        Some(_) => return ToolResult::err("Parameter 'threat' must be a string"),
+    };
+
+    match state.set_objective(objective, threat) {
+        Ok(message) => ToolResult::ok(format!("🎯 {message}")),
+        Err(message) => ToolResult::err(format!("❌ {message}")),
+    }
+}
+
 fn dispatch_get_inventory(state: &GameState) -> ToolResult {
     if state.inventory.is_empty() {
         return ToolResult::ok("🎒 Inventory is empty.");
@@ -552,7 +687,11 @@ fn dispatch_add_to_inventory(state: &mut GameState, args: &Value) -> ToolResult 
     let Some(description) = arg_str(args, "description") else {
         return missing("description");
     };
-    let quantity = arg_i32(args, "quantity").unwrap_or(1);
+    let quantity = match i32_arg(args, "quantity", 1, i64::from(MAX_ITEM_QUANTITY)) {
+        Ok(Some(n)) => n,
+        Ok(None) => 1,
+        Err(e) => return e,
+    };
 
     let result = state.add_item(item, description, quantity);
     if result.starts_with("Added") {
@@ -567,7 +706,11 @@ fn dispatch_remove_from_inventory(state: &mut GameState, args: &Value) -> ToolRe
     let Some(item) = arg_str(args, "item") else {
         return missing("item");
     };
-    let quantity = arg_i32(args, "quantity").unwrap_or(1);
+    let quantity = match i32_arg(args, "quantity", 1, i64::from(MAX_ITEM_QUANTITY)) {
+        Ok(Some(n)) => n,
+        Ok(None) => 1,
+        Err(e) => return e,
+    };
 
     let result = state.remove_item(item, quantity);
     if result.starts_with("Removed") {
@@ -690,6 +833,7 @@ fn dispatch_get_journal(state: &GameState) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::state::{MAX_OBJECTIVE_CHARS, MAX_THREAT_CHARS};
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -736,7 +880,131 @@ mod tests {
         assert!(is_mutating("start_combat"));
         assert!(is_mutating("advance_turn"));
         assert!(is_mutating("end_combat"));
-        assert_eq!(MUTATING_TOOLS.len(), 11);
+        assert!(is_mutating("set_objective"));
+        assert_eq!(MUTATING_TOOLS.len(), 12);
+    }
+
+    #[test]
+    fn set_objective_is_in_schema_and_dispatch() {
+        let defs = tool_definitions();
+        let def = defs
+            .iter()
+            .find(|def| def.function.name == "set_objective")
+            .expect("set_objective definition");
+        assert!(def.function.description.contains("objective"));
+        let properties = &def.function.parameters["properties"];
+        assert_eq!(properties["objective"]["type"], "string");
+        assert_eq!(properties["threat"]["type"], "string");
+        assert_eq!(properties["complete"]["type"], "boolean");
+
+        let mut state = fresh();
+        let result = dispatch(
+            &mut state,
+            "set_objective",
+            &json!({"objective": "Find the relic", "threat": "The ritual nears"}),
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(state.objective.as_deref(), Some("Find the relic"));
+
+        let unknown = dispatch(&mut state, "set_objectives", &json!({}));
+        assert!(unknown.is_error);
+        assert!(unknown.content.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn set_objective_sets_trims_and_caps() {
+        let mut state = fresh();
+        let objective = format!("  {}  ", "x".repeat(MAX_OBJECTIVE_CHARS + 50));
+        let threat = format!("  {}  ", "y".repeat(MAX_THREAT_CHARS + 50));
+        let result = dispatch(
+            &mut state,
+            "set_objective",
+            &json!({"objective": objective, "threat": threat}),
+        );
+        assert!(!result.is_error, "{}", result.content);
+
+        let objective = state.objective.as_deref().expect("objective stored");
+        assert_eq!(objective.chars().count(), MAX_OBJECTIVE_CHARS);
+        assert_eq!(objective, objective.trim());
+        let threat = state.threat.clone().expect("threat stored");
+        assert_eq!(threat.chars().count(), MAX_THREAT_CHARS);
+        assert_eq!(&threat, threat.trim());
+        assert!(result.content.contains("Objective set:"));
+        assert!(
+            state
+                .game_log
+                .iter()
+                .any(|entry| entry.starts_with("Objective set:"))
+        );
+
+        // Updating only the objective keeps the existing threat.
+        let result = dispatch(
+            &mut state,
+            "set_objective",
+            &json!({"objective": "New goal"}),
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(state.objective.as_deref(), Some("New goal"));
+        assert_eq!(state.threat.as_deref(), Some(threat.as_str()));
+
+        // An explicit empty threat clears it.
+        let result = dispatch(
+            &mut state,
+            "set_objective",
+            &json!({"objective": "New goal", "threat": "  "}),
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(state.threat.is_none());
+    }
+
+    #[test]
+    fn set_objective_rejects_blank_and_bad_args() {
+        let mut state = fresh();
+        for args in [
+            json!({"objective": "   "}),
+            json!({}),
+            json!({"objective": 7}),
+            json!({"objective": "Valid goal", "threat": 7}),
+            json!({"objective": "Valid goal", "complete": "yes"}),
+        ] {
+            let result = dispatch(&mut state, "set_objective", &args);
+            assert!(result.is_error, "should reject {args}: {result:?}");
+        }
+        assert!(state.objective.is_none());
+        assert!(state.threat.is_none());
+    }
+
+    #[test]
+    fn set_objective_completes_and_clears() {
+        let mut state = fresh();
+        dispatch(
+            &mut state,
+            "set_objective",
+            &json!({"objective": "Save the village", "threat": "The flood arrives at dusk"}),
+        );
+
+        let result = dispatch(&mut state, "set_objective", &json!({"complete": true}));
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("Objective complete: Save the village"),
+            "{}",
+            result.content
+        );
+        assert!(state.objective.is_none());
+        assert!(state.threat.is_none());
+        assert!(
+            state
+                .game_log
+                .iter()
+                .any(|entry| entry == "Objective complete: Save the village")
+        );
+
+        // Completing with nothing active is still a safe, sensible response.
+        let result = dispatch(&mut state, "set_objective", &json!({"complete": true}));
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("Objective complete"));
     }
 
     #[test]
@@ -1161,8 +1429,116 @@ mod tests {
                     assert!(!state.in_combat);
                     assert!(state.initiative_order.is_empty());
                 }
+                "set_objective" => {
+                    dispatch(
+                        &mut state,
+                        name,
+                        &json!({"objective": "Find the relic", "threat": "The ritual nears"}),
+                    );
+                    assert_eq!(state.objective.as_deref(), Some("Find the relic"));
+                    assert_eq!(state.threat.as_deref(), Some("The ritual nears"));
+                }
                 other => panic!("untested mutating tool: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn numeric_args_reject_huge_and_fractional_values() {
+        let mut state = fresh();
+        let hp = state.hp;
+        let cases = [
+            ("modify_hp", json!({"amount": i64::MAX})),
+            ("modify_hp", json!({"amount": 2.5})),
+            ("modify_hp", json!({"amount": "lots"})),
+            (
+                "add_to_inventory",
+                json!({"item": "Gem", "description": "shiny", "quantity": 1e12}),
+            ),
+            (
+                "add_to_inventory",
+                json!({"item": "Gem", "description": "shiny", "quantity": 2.5}),
+            ),
+            (
+                "remove_from_inventory",
+                json!({"item": "Gem", "quantity": -1}),
+            ),
+            ("roll_dice", json!({"sides": 20, "count": 1.5})),
+            ("roll_dice", json!({"sides": 20, "count": 1_000_000})),
+            ("roll_dice", json!({"sides": 20, "modifier": i64::MAX})),
+            (
+                "remember",
+                json!({"fact": "x".repeat(crate::game::state::MAX_JOURNAL_FACT_CHARS + 1)}),
+            ),
+        ];
+
+        for (tool, args) in cases {
+            let result = dispatch(&mut state, tool, &args);
+            assert!(result.is_error, "{tool} should reject {args}: {result:?}");
+        }
+        assert_eq!(state.hp, hp);
+        assert!(state.inventory.is_empty());
+        assert!(state.journal.is_empty());
+    }
+
+    #[test]
+    fn integer_strings_still_work() {
+        let mut state = fresh();
+        let result = dispatch(&mut state, "modify_hp", &json!({"amount": "-2"}));
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(state.hp, 18);
+    }
+
+    #[test]
+    fn absurd_ability_score_is_a_tool_error() {
+        let mut state = fresh();
+        state.stats.insert("STR".into(), i32::MAX);
+        let result = dispatch(
+            &mut state,
+            "roll_dice",
+            &json!({"sides": 20, "ability": "STR"}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("invalid STR score"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn combat_tool_validates_participants() {
+        let mut state = fresh();
+        let missing_player = dispatch(
+            &mut state,
+            "start_combat",
+            &json!({"participants": ["Goblin"]}),
+        );
+        assert!(missing_player.is_error);
+        assert!(missing_player.content.contains("must include the player"));
+
+        let not_strings = dispatch(
+            &mut state,
+            "start_combat",
+            &json!({"participants": ["Hero", 7]}),
+        );
+        assert!(not_strings.is_error);
+        assert!(not_strings.content.contains("array of strings"));
+
+        let started = dispatch(
+            &mut state,
+            "start_combat",
+            &json!({"participants": ["Hero", "hero", "Goblin"]}),
+        );
+        assert!(!started.is_error, "{}", started.content);
+        assert_eq!(state.initiative_order, vec!["Hero", "Goblin"]);
+
+        let again = dispatch(
+            &mut state,
+            "start_combat",
+            &json!({"participants": ["Hero", "Wolf"]}),
+        );
+        assert!(again.is_error);
+        assert!(again.content.contains("already in combat"));
     }
 }

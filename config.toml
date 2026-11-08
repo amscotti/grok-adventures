@@ -1,65 +1,66 @@
 # Grok Adventures Configuration
 #
 # CLI overrides (session only):
-#   --name / -n     character name (skips minimal-mode name prompt)
-#   --load SLOT     load saves/SLOT.json
-#   --minimal       linear block UI
-#   --fullscreen    ratatui sticky status + scrollback
-#   --autopilot             AI player stress test (minimal UI)
-#   --scripted-autopilot    fixed action rotation (no second model)
-#   --player-style STYLE    cautious | balanced | reckless (autopilot agent)
-#   --turns N               autopilot turn cap
-#   --no-tts                disable DM speech
-#   --no-stt                disable push-to-talk
+#   --name / -n NAME        character name (skips the name prompt)
+#   --class CLASS           fighter | rogue | wizard | cleric | none
+#   --load SLOT             load saves/SLOT.json (or an explicit path)
+#   --minimal               linear block UI (default)
+#   --fullscreen            ratatui sticky status + scrollback
+#   --autopilot             AI player stress test (always minimal; no STT/TTS)
+#   --scripted-autopilot    with --autopilot: fixed action rotation (no second model)
+#   --player-style STYLE    with --autopilot: cautious | balanced | reckless
+#   --turns N               autopilot turn cap (default 20)
+#   --no-tts                disable DM speech for this session
+#   --no-stt                disable push-to-talk for this session
 #   --config PATH           this file (default config.toml)
 #
-# Env: XAI_API_KEY (preferred), XAI_MODEL, XAI_PLAYER_MODEL,
-#      XAI_REASONING_EFFORT (low|medium|high|xhigh), XAI_STT_MODEL,
-#      GROK_ADVENTURES_PLAYER_STYLE, GROK_ADVENTURES_SCRIPTED_AUTOPILOT=1,
-#      GROK_ADVENTURES_DEBUG=1, NO_COLOR
+# Environment wins over this file. Set XAI_API_KEY (or [xai].api_key below);
+# there is no offline mode.
+#   XAI_API_KEY, XAI_MODEL, XAI_PLAYER_MODEL, XAI_REASONING_EFFORT,
+#   XAI_STT_MODEL, GROK_ADVENTURES_PLAYER_STYLE,
+#   GROK_ADVENTURES_SCRIPTED_AUTOPILOT=1, GROK_ADVENTURES_DEBUG=1,
+#   NO_COLOR, RUST_LOG
+#
+# Unknown/removed keys are ignored, so older config files still load.
+# Rules: dnd5e-lite (d20 + ability modifier, standard dice, HP, inventory,
+# initiative, homebrew rests; no AC/proficiency/levels/spell slots).
 
 [xai]
-api_key = ""  # Set via XAI_API_KEY env var or here
+api_key = ""  # Prefer the XAI_API_KEY environment variable or .env
 # Latest Grok. Override with XAI_MODEL / XAI_PLAYER_MODEL.
 model = "grok-4.7"
 player_model = "grok-4.7"
-# low keeps tool turns snappy. The API default is high.
+# low keeps tool turns snappy. Options: low | medium | high | xhigh.
 reasoning_effort = "low"
 
 [ui]
-# fullscreen = ratatui TUI; minimal = linear block print
+# fullscreen = ratatui TUI; minimal = linear block print (default)
 mode = "minimal"          # minimal | fullscreen
-theme = "groknight"       # groknight | grokday | auto
-compact = false
+# Fullscreen theme; /theme cycles groknight -> grokday -> mono.
+# Minimal mode uses the fixed GrokNight palette.
+theme = "groknight"       # groknight | grokday | mono
+compact = false           # tighter fullscreen density
 tools_expanded = false    # collapse tool groups by default
 show_shortcuts = true
 
 [voice]
 # Player input: typing is always on. STT is optional:
 #   minimal mode: `talk` (record until Enter)
-#   fullscreen:   hold F2 to talk, release to send (or `talk`)
+#   fullscreen:   hold Ctrl+Space (or F2) to talk, release to send (or `talk`)
 enable_stt = true
 # Insert transcript into the prompt for editing (true) vs auto-submit (false)
 stt_edit_before_send = true
 # DM output speech (independent of whether the player typed or spoke)
 enable_tts = true
-# DM voice — options: zagan (dramatic), orion (cinematic), luna (gentle),
-#   eve (energetic), rigel (precise professional)
+# DM voice — options include zagan (dramatic), orion (cinematic), luna (gentle),
+# eve (energetic), rigel (precise professional)
 dm_voice = "zagan"
-# Narration voice for NPCs — can change per-NPC
-narrator_voice = "orion"
 
 [game]
-# Tone: "dark_fantasy", "heroic", "comedic", "custom"
+# Tone: dark_fantasy | heroic | comedic. Other values fall back to heroic.
 tone = "heroic"
-# Dice system: "dnd5e", "simple", "custom"
-ruleset = "dnd5e"
 # Prior player/DM exchanges kept as chat messages (0 = state+log only)
 history_turns = 8
-
-[tts]
-# Output format: "mp3", "wav", "pcm"
-format = "mp3"
 
 [stt]
 # Latest xAI transcription model. Override with XAI_STT_MODEL.
@@ -72,7 +73,8 @@ streaming = true
 device = -1
 # Sample rate
 sample_rate = 16000
-# Default push-to-talk / fixed record length (seconds)
+# Fullscreen `/talk` with no argument uses this default.
+# Minimal `/talk` and fullscreen hold-to-talk use max_record_seconds instead.
 record_seconds = 12
-# Hard cap for Enter-to-stop (minimal) and F2 hold (fullscreen)
+# Hard cap for `/talk` and hold-to-talk in both UIs
 max_record_seconds = 60

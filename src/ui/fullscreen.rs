@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,9 +25,9 @@ use crate::config::Config;
 use crate::dm::{ChatHistory, DmClient, is_turn_cancelled};
 use crate::game::delta::{self, StateSnapshot};
 use crate::game::loop_::{
-    MetaResult, SessionFlags, handle_meta_command, handle_state_query_blocks, make_dm_client,
-    maybe_speak_dm, run_dm_turn_cancellable, start_session_collect, stt_client,
-    turn_blocks_with_deltas,
+    MetaResult, SessionFlags, ensure_alive, handle_meta_command, handle_state_query_blocks,
+    make_dm_client, maybe_speak_dm, run_dm_turn_cancellable, seed_history, session_usage_block,
+    spawn_speak_dm, start_session_collect, stt_client, turn_blocks_with_deltas,
 };
 use crate::game::save::SaveGame;
 use crate::game::state::GameState;
@@ -56,6 +56,8 @@ struct TerminalGuard {
     /// Whether we pushed keyboard enhancement (for push-to-talk press/release).
     kb_enhanced: bool,
     mouse_enabled: bool,
+    /// Whether bracketed paste is active (multi-line clipboard input).
+    paste_enabled: bool,
 }
 
 impl TerminalGuard {
@@ -71,6 +73,9 @@ impl TerminalGuard {
         .is_ok();
         // Mouse wheel → scrollback.
         let mouse_enabled = execute!(stdout, EnableMouseCapture).is_ok();
+        // Deliver a multi-line paste as one Event::Paste instead of a burst
+        // of Enter/character keys that would submit line by line.
+        let paste_enabled = execute!(stdout, EnableBracketedPaste).is_ok();
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend).context("create terminal")?;
         Ok((
@@ -80,6 +85,7 @@ impl TerminalGuard {
                 active: true,
                 kb_enhanced,
                 mouse_enabled,
+                paste_enabled,
             },
         ))
     }
@@ -89,6 +95,9 @@ impl TerminalGuard {
             return;
         }
         self.active = false;
+        if self.paste_enabled {
+            let _ = execute!(self.stdout, DisableBracketedPaste);
+        }
         if self.mouse_enabled {
             let _ = execute!(self.stdout, DisableMouseCapture);
         }
@@ -142,7 +151,7 @@ pub async fn run_fullscreen_interactive(
         config.ui.show_shortcuts,
         config.ui.compact,
     );
-    app.status_line = status::format_status_plain(state);
+    app.status_line = status::StatusLine::from_state(state);
     let mut ptt: Option<PttCapture> = None;
 
     let mut hello = format!(
@@ -162,33 +171,60 @@ pub async fn run_fullscreen_interactive(
         kind: SystemKind::Info,
     });
 
-    // Opening / resume
+    // Opening / resume. Keep the terminal responsive while the DM request is
+    // in flight: Esc aborts it, Ctrl+C quits, and typing is buffered by the
+    // composer so the first prompt is never a dead screen.
     app.activity = Some("Setting the scene…".into());
     redraw(&mut terminal, &app)?;
-    let opening = start_session_collect(state, &client, resume, tone, &mut history).await;
-    app.activity = None;
-    match opening {
-        Ok((blocks, result)) => {
-            app.push_blocks(blocks);
-            app.tools_expanded = flags.tools_expanded;
-            app.status_line = status::format_status_plain(state);
-            // Speak the opening text as soon as it is ready.
-            if flags.enable_tts {
-                app.activity = Some("Speaking…".into());
-                redraw(&mut terminal, &app)?;
-                if let Some(err) =
-                    maybe_speak_dm(&tts, &result.text, dm_voice, true, Some(&playback)).await
-                {
-                    app.push_block(err);
+    let opening = {
+        let opening_fut = start_session_collect(state, &client, resume, tone, &mut history);
+        tokio::pin!(opening_fut);
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut opening_fut => break Some(res),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    match drain_busy_events(&mut app, &mut terminal)? {
+                        BusyDrain::Cancel => {
+                            playback.stop();
+                            app.pending_action = None;
+                            app.push_block(Block::System {
+                                text: "Opening cancelled — type an action or /help.".into(),
+                                kind: SystemKind::Info,
+                            });
+                            break None;
+                        }
+                        BusyDrain::Quit => {
+                            playback.stop();
+                            app.should_quit = true;
+                            break None;
+                        }
+                        BusyDrain::None => {}
+                    }
                 }
-                app.activity = None;
             }
         }
-        Err(e) => {
-            app.push_block(Block::System {
-                text: format!("Failed to start session: {e:#}"),
-                kind: SystemKind::Error,
-            });
+    };
+    app.activity = None;
+    if let Some(opening) = opening {
+        match opening {
+            Ok((blocks, result)) => {
+                app.push_blocks(blocks);
+                app.usage.record_turn(&result.usage);
+                app.tools_expanded = flags.tools_expanded;
+                app.status_line = status::StatusLine::from_state(state);
+                // Speak a fresh opening; resume is a local recap and stays silent.
+                // Background speech keeps the composer available immediately.
+                if flags.enable_tts && !resume {
+                    spawn_speak_dm(&tts, &result.text, dm_voice, &playback);
+                }
+            }
+            Err(e) => {
+                app.push_block(Block::System {
+                    text: format!("Failed to start session: {e:#}"),
+                    kind: SystemKind::Error,
+                });
+            }
         }
     }
     redraw(&mut terminal, &app)?;
@@ -209,7 +245,7 @@ pub async fn run_fullscreen_interactive(
                     kind: SystemKind::Info,
                 });
                 death_announced = true;
-                app.status_line = status::format_status_plain(state);
+                app.status_line = status::StatusLine::from_state(state);
             }
         } else {
             death_announced = false;
@@ -233,6 +269,7 @@ pub async fn run_fullscreen_interactive(
                         max_record_secs,
                     );
                 }
+                Event::Paste(text) => app.on_paste(&text),
                 Event::Mouse(me) => match me.kind {
                     MouseEventKind::ScrollUp => app.on_scroll_up(),
                     MouseEventKind::ScrollDown => app.on_scroll_down(),
@@ -245,8 +282,9 @@ pub async fn run_fullscreen_interactive(
             }
         }
 
-        // Live words while holding push-to-talk.
-        if let Some(cap) = ptt.as_ref() {
+        // Live words while holding push-to-talk. Once released, keep the
+        // last partial on screen but stop overwriting "Transcribing…".
+        if let (Some(cap), true) = (ptt.as_ref(), app.ptt_held) {
             let elapsed = cap.started.elapsed().as_secs();
             let label = format!("Listening · {elapsed}/{}s", cap.max_secs);
             let live = cap.listen.partial();
@@ -294,7 +332,7 @@ pub async fn run_fullscreen_interactive(
                 }
             }
             app.tools_expanded = flags.tools_expanded;
-            app.status_line = status::format_status_plain(state);
+            app.status_line = status::StatusLine::from_state(state);
             app.activity = None;
             app.live_line.clear();
         }
@@ -319,6 +357,7 @@ pub async fn run_fullscreen_interactive(
                 sample_rate,
                 device,
                 &mut history,
+                config.game.history_turns,
                 &playback,
             )
             .await
@@ -329,13 +368,15 @@ pub async fn run_fullscreen_interactive(
                 });
             }
             app.tools_expanded = flags.tools_expanded;
-            app.status_line = status::format_status_plain(state);
+            app.status_line = status::StatusLine::from_state(state);
             app.activity = None;
         }
     }
 
     // Autosave on clean exit
+    playback.stop();
     if state.alive()
+        && state.has_progress()
         && let Err(e) = SaveGame::save_slot(state, Some("autosave"))
     {
         // Terminal still up briefly — push message then restore.
@@ -375,6 +416,21 @@ fn is_ptt_key(key: &KeyEvent) -> bool {
             .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER)
 }
 
+/// Leave recording state immediately when capture is told to stop, so the
+/// composer accepts keys while the transcription task finishes.
+fn mark_ptt_transcribing(app: &mut FullscreenApp) {
+    app.ptt_held = false;
+    app.activity = Some("Transcribing…".into());
+}
+
+/// Stop the live capture (if any) and flip the UI to the transcribing state.
+fn stop_ptt_capture(app: &mut FullscreenApp, ptt: &mut Option<PttCapture>) {
+    if let Some(cap) = ptt.as_ref() {
+        cap.listen.stop();
+        mark_ptt_transcribing(app);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key_with_ptt(
     app: &mut FullscreenApp,
@@ -405,16 +461,15 @@ fn handle_key_with_ptt(
             KeyEventKind::Release | KeyEventKind::Press if app.ptt_held => {
                 // Release = normal hold-to-talk end; Press while held = toggle stop
                 // on terminals that only emit Press.
-                if let Some(cap) = ptt.as_ref() {
-                    cap.listen.stop();
-                }
+                stop_ptt_capture(app, ptt);
             }
+            // A second press while the previous capture is still transcribing
+            // is ignored: only one capture may be in flight.
             _ => {}
         }
         return;
     }
 
-    // Ignore other keys while holding PTT (except Ctrl+C).
     if key.kind != KeyEventKind::Press {
         return;
     }
@@ -429,28 +484,44 @@ fn handle_key_with_ptt(
     }
 
     if app.ptt_held {
-        // Esc cancels / stops recording early.
-        if key.code == KeyCode::Esc
-            && let Some(cap) = ptt.as_ref()
-        {
-            cap.listen.stop();
+        // Esc stops recording early; other keys are ignored while the mic is
+        // live. After release the held flag is already false, so typing works
+        // even while the transcription task is still finishing.
+        if key.code == KeyCode::Esc {
+            stop_ptt_capture(app, ptt);
         }
+        return;
+    }
+
+    handle_idle_key(app, key);
+}
+
+/// Handle one non-PTT key while the composer is idle.
+fn handle_idle_key(app: &mut FullscreenApp, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
         return;
     }
 
     match key.code {
         KeyCode::Esc => app.on_esc(),
         KeyCode::Tab => {
-            // Tab completes a slash command when the menu is open;
-            // otherwise it keeps its focus-toggle role.
-            if !(app.focus == crate::ui::app::Focus::Prompt && app.apply_completion()) {
+            // Tab completes a slash command when the menu is open. Otherwise
+            // it toggles focus only from an empty composer; a bare Tab must
+            // never strand a non-empty draft in scrollback focus.
+            if app.focus == crate::ui::app::Focus::Prompt && app.apply_completion() {
+                // completed
+            } else if app.prompt.is_empty() {
                 app.toggle_focus();
             }
         }
         KeyCode::BackTab => {
             if app.focus == crate::ui::app::Focus::Prompt && app.completions.is_open() {
                 app.completions.move_up();
-            } else {
+            } else if app.prompt.is_empty() {
                 app.toggle_focus();
             }
         }
@@ -493,16 +564,191 @@ fn handle_key_with_ptt(
         KeyCode::PageDown => {
             app.scrollback.scroll_down(10);
         }
-        KeyCode::Char(c) => {
-            // Ctrl+L clear scrollback (nice to have)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'l' || c == 'L') {
-                app.scrollback.clear();
-            } else {
-                app.on_char(c);
-            }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.on_ctrl_edit(c);
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            app.on_char(c);
         }
         _ => {}
     }
+}
+
+/// What the caller should do after a key arrives during a DM turn or speech.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyOutcome {
+    /// Key was handled (typing, editing, queueing, scrolling).
+    Handled,
+    /// Esc: cancel the in-flight turn or stop speech.
+    Cancel,
+    /// Ctrl+C: quit the app.
+    Quit,
+}
+
+/// Handle a key while a DM turn or TTS is in flight.
+///
+/// The composer stays editable: printable/editing keys buffer into the prompt
+/// and Enter queues the line for the outer loop (never a second concurrent
+/// turn). Esc cancels the turn/speech; Ctrl+C quits. The caller owns playback
+/// and cancellation tokens, so this helper is unit-testable without a live
+/// TTS or game handle.
+fn handle_busy_key(app: &mut FullscreenApp, key: KeyEvent) -> BusyOutcome {
+    if key.kind != KeyEventKind::Press {
+        return BusyOutcome::Handled;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return BusyOutcome::Quit;
+    }
+    if key.code == KeyCode::Esc {
+        return BusyOutcome::Cancel;
+    }
+
+    match key.code {
+        KeyCode::Enter => app.submit_prompt(),
+        KeyCode::Tab => {
+            if app.focus == crate::ui::app::Focus::Prompt {
+                app.apply_completion();
+            }
+        }
+        KeyCode::BackTab => {
+            if app.focus == crate::ui::app::Focus::Prompt && app.completions.is_open() {
+                app.completions.move_up();
+            }
+        }
+        // Editing keys target the composer even if the user was scrolling.
+        KeyCode::Backspace => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_backspace();
+        }
+        KeyCode::Delete => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_delete();
+        }
+        KeyCode::Left => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_left();
+        }
+        KeyCode::Right => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_right();
+        }
+        KeyCode::Home => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_home();
+        }
+        KeyCode::End => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_end();
+        }
+        KeyCode::Up => {
+            if app.focus == crate::ui::app::Focus::Prompt {
+                if app.completions.is_open() {
+                    app.completions.move_up();
+                } else {
+                    let _ = app.history_up();
+                }
+            } else {
+                app.on_scroll_up();
+            }
+        }
+        KeyCode::Down => {
+            if app.focus == crate::ui::app::Focus::Prompt {
+                if app.completions.is_open() {
+                    app.completions.move_down();
+                } else {
+                    let _ = app.history_down();
+                }
+            } else {
+                app.on_scroll_down();
+            }
+        }
+        KeyCode::PageUp => app.scrollback.scroll_up(10),
+        KeyCode::PageDown => app.scrollback.scroll_down(10),
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_ctrl_edit(c);
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            app.focus = crate::ui::app::Focus::Prompt;
+            app.on_char(c);
+        }
+        _ => {}
+    }
+    // Keep the slash menu current so Tab completion works mid-turn too.
+    app.sync_completions();
+    BusyOutcome::Handled
+}
+
+/// Queue of work the busy loop observed while the DM was talking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyDrain {
+    None,
+    Cancel,
+    Quit,
+}
+
+/// Drain all pending terminal events while a turn/speech future is polled.
+/// Typed keys and pastes update the composer live; only Esc/Ctrl+C change the
+/// caller's control flow.
+fn drain_busy_events(
+    app: &mut FullscreenApp,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<BusyDrain> {
+    let mut drain = BusyDrain::None;
+    let mut changed = false;
+    while event::poll(Duration::from_millis(0)).context("poll during DM turn")? {
+        match event::read().context("read during DM turn")? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match handle_busy_key(app, key) {
+                    BusyOutcome::Handled => {}
+                    BusyOutcome::Cancel => {
+                        if drain != BusyDrain::Quit {
+                            drain = BusyDrain::Cancel;
+                        }
+                    }
+                    BusyOutcome::Quit => drain = BusyDrain::Quit,
+                }
+                changed = true;
+            }
+            Event::Paste(text) => {
+                app.on_paste(&text);
+                app.sync_completions();
+                changed = true;
+            }
+            Event::Resize(_, _) => changed = true,
+            _ => {}
+        }
+    }
+    if changed {
+        redraw(terminal, app)?;
+    }
+    Ok(drain)
+}
+
+/// On cancel, keep a draft typed during the turn; otherwise restore the
+/// cancelled action so it can be edited and resent.
+fn restore_cancelled_draft(app: &mut FullscreenApp, cancelled: &str) {
+    if app.prompt.input().trim().is_empty() {
+        app.prompt.set(cancelled);
+    }
+}
+
+/// `/again` repeats the last dispatched DM action, never the prompt-history
+/// line (which would otherwise be the literal `/again`).
+fn repeat_target(app: &FullscreenApp) -> Option<String> {
+    app.last_action.clone()
 }
 
 /// Put a finished transcript in the composer, or send it when edit-before-send is off.
@@ -575,6 +821,7 @@ async fn process_action(
     sample_rate: u32,
     device: i32,
     history: &mut ChatHistory,
+    history_turns: u32,
     playback: &ActivePlayback,
 ) -> Result<()> {
     // Fullscreen-local commands before generic meta.
@@ -618,7 +865,11 @@ async fn process_action(
             }
             return Ok(());
         }
-        if let Some(prev) = app.history.last().map(str::to_string) {
+        if let Some(block) = ensure_alive(state) {
+            app.push_block(block);
+            return Ok(());
+        }
+        if let Some(prev) = repeat_target(app) {
             return run_player_turn(
                 state, client, tts, app, terminal, &prev, false, flags, tone, dm_voice, history,
                 playback,
@@ -635,17 +886,41 @@ async fn process_action(
     match handle_meta_command(state, input, flags)? {
         (MetaResult::Quit, blocks) => {
             app.push_blocks(blocks);
+            playback.stop();
             app.should_quit = true;
             return Ok(());
         }
         (MetaResult::Handled, blocks) => {
             app.push_blocks(blocks);
             app.tools_expanded = flags.tools_expanded;
-            app.status_line = status::format_status_plain(state);
+            app.status_line = status::StatusLine::from_state(state);
+            return Ok(());
+        }
+        (MetaResult::Loaded, blocks) => {
+            playback.stop();
+            app.push_blocks(blocks);
+            // New campaign: no stale DM conversation, `/copy` text, or
+            // `/again` action may survive the state swap.
+            *history = ChatHistory::new(history_turns);
+            seed_history(history, state);
+            app.reset_session_after_load(state.last_narration.as_deref());
+            app.tools_expanded = flags.tools_expanded;
+            app.status_line = status::StatusLine::from_state(state);
+            return Ok(());
+        }
+        (MetaResult::Usage, _) => {
+            // Local only: the session accumulator lives on the app, never in
+            // a save, and `/usage` never reaches the DM.
+            app.push_block(session_usage_block(&app.usage));
             return Ok(());
         }
         (MetaResult::Talk { seconds }, blocks) => {
             app.push_blocks(blocks);
+            if let Some(block) = ensure_alive(state) {
+                app.push_block(block);
+                app.status_line = status::StatusLine::from_state(state);
+                return Ok(());
+            }
             if !flags.enable_stt {
                 app.push_block(Block::System {
                     text: "STT is off. Enable with /voice.".into(),
@@ -767,29 +1042,21 @@ async fn run_player_turn(
                 biased;
                 res = &mut dm_fut => break res,
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                    // Drain pending keys while the DM is thinking.
-                    while event::poll(Duration::from_millis(0)).context("poll during DM turn")? {
-                        match event::read().context("read during DM turn")? {
-                            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL)
-                                    && key.code == KeyCode::Char('c')
-                                {
-                                    // Still allow hard quit during a long turn.
-                                    app.should_quit = true;
-                                    cancel.cancel();
-                                    playback.stop();
-                                } else if key.code == KeyCode::Esc {
-                                    cancel.cancel();
-                                    playback.stop();
-                                    app.activity = Some("Cancelling…".into());
-                                    redraw(terminal, app)?;
-                                }
-                            }
-                            Event::Resize(_, _) => {
-                                redraw(terminal, app)?;
-                            }
-                            _ => {}
+                    // Keep the composer editable while the DM is thinking.
+                    match drain_busy_events(app, terminal)? {
+                        BusyDrain::Cancel => {
+                            cancel.cancel();
+                            playback.stop();
+                            app.activity = Some("Cancelling…".into());
+                            redraw(terminal, app)?;
                         }
+                        BusyDrain::Quit => {
+                            // Still allow hard quit during a long turn.
+                            app.should_quit = true;
+                            cancel.cancel();
+                            playback.stop();
+                        }
+                        BusyDrain::None => {}
                     }
                 }
             }
@@ -807,9 +1074,12 @@ async fn run_player_turn(
                 text: "Turn cancelled.".into(),
                 kind: SystemKind::Info,
             });
-            // Keep the draft so the player can edit / resend.
-            app.prompt.set(input);
-            app.status_line = status::format_status_plain(state);
+            // Keep a draft typed during the turn; otherwise restore the
+            // cancelled action so the player can edit / resend. A line queued
+            // with Enter is dropped: Esc means stop, not "run the next one".
+            app.pending_action = None;
+            restore_cancelled_draft(app, input);
+            app.status_line = status::StatusLine::from_state(state);
             return Ok(());
         }
         Err(e) => {
@@ -823,11 +1093,13 @@ async fn run_player_turn(
     };
 
     app.activity = None;
+    app.usage.record_turn(&result.usage);
+    app.last_action = Some(input.to_string());
     if delta::took_damage(&before, state) {
         audio::maybe_play_damage_sfx();
     }
     app.push_blocks(turn_blocks_with_deltas(&result, &before, state));
-    app.status_line = status::format_status_plain(state);
+    app.status_line = status::StatusLine::from_state(state);
 
     // Speak the narration as soon as it is available; Esc stops speech.
     if flags.enable_tts {
@@ -845,29 +1117,18 @@ async fn run_player_turn(
                     speak_done = Some(res);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                    while event::poll(Duration::from_millis(0)).context("poll during narrate")? {
-                        match event::read().context("read during narrate")? {
-                            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                                if key.code == KeyCode::Esc
-                                    || (key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && key.code == KeyCode::Char('c'))
-                                {
-                                    // Stop speech immediately.
-                                    playback.stop();
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && key.code == KeyCode::Char('c')
-                                    {
-                                        app.should_quit = true;
-                                    }
-                                    app.activity = Some("Speech cancelled…".into());
-                                    redraw(terminal, app)?;
-                                }
-                            }
-                            Event::Resize(_, _) => {
-                                redraw(terminal, app)?;
-                            }
-                            _ => {}
+                    // Typing stays live while narration plays; Esc stops speech.
+                    match drain_busy_events(app, terminal)? {
+                        BusyDrain::Cancel => {
+                            playback.stop();
+                            app.activity = Some("Speech cancelled…".into());
+                            redraw(terminal, app)?;
                         }
+                        BusyDrain::Quit => {
+                            playback.stop();
+                            app.should_quit = true;
+                        }
+                        BusyDrain::None => {}
                     }
                 }
             }
@@ -899,6 +1160,26 @@ mod tests {
     }
 
     #[test]
+    fn again_repeats_dm_action_not_the_again_line() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.last_action = Some("attack the goblin".into());
+        app.history.push("/again");
+        assert_eq!(
+            repeat_target(&app).as_deref(),
+            Some("attack the goblin"),
+            "the literal /again line must never be replayed"
+        );
+    }
+
+    #[test]
+    fn again_without_a_dm_action_has_no_target() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.history.push("/help");
+        app.history.push("look around");
+        assert_eq!(repeat_target(&app), None);
+    }
+
+    #[test]
     fn ptt_accepts_ctrl_space_f2_and_nul() {
         assert!(is_ptt_key(&key(KeyCode::F(2), KeyModifiers::empty())));
         assert!(is_ptt_key(&key(KeyCode::Char(' '), KeyModifiers::CONTROL)));
@@ -924,5 +1205,225 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT
         )));
         assert!(!is_ptt_key(&key(KeyCode::Esc, KeyModifiers::empty())));
+    }
+
+    fn idle(app: &mut FullscreenApp, code: KeyCode, modifiers: KeyModifiers) {
+        handle_idle_key(app, key(code, modifiers));
+    }
+
+    #[test]
+    fn busy_keys_buffer_into_the_composer() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        for c in "look around".chars() {
+            assert_eq!(
+                handle_busy_key(&mut app, key(KeyCode::Char(c), KeyModifiers::empty())),
+                BusyOutcome::Handled
+            );
+        }
+        assert_eq!(app.prompt.input(), "look around");
+        assert_eq!(app.prompt.cursor(), 11);
+
+        // Editing keys work too, including readline word delete.
+        handle_busy_key(&mut app, key(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.prompt.input(), "look aroun");
+        handle_busy_key(&mut app, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.prompt.input(), "look ");
+    }
+
+    #[test]
+    fn busy_enter_queues_for_the_outer_loop() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        for c in "open the door".chars() {
+            handle_busy_key(&mut app, key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(
+            handle_busy_key(&mut app, key(KeyCode::Enter, KeyModifiers::empty())),
+            BusyOutcome::Handled
+        );
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.take_pending().as_deref(), Some("open the door"));
+        assert!(app.take_pending().is_none(), "exactly one queued action");
+        assert_eq!(app.history.last(), Some("open the door"));
+    }
+
+    #[test]
+    fn busy_esc_cancels_without_clearing_the_draft() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.insert_str("typed during turn");
+        assert_eq!(
+            handle_busy_key(&mut app, key(KeyCode::Esc, KeyModifiers::empty())),
+            BusyOutcome::Cancel
+        );
+        assert_eq!(app.prompt.input(), "typed during turn");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn busy_ctrl_c_quits() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        assert_eq!(
+            handle_busy_key(&mut app, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            BusyOutcome::Quit
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn cancel_keeps_new_draft_or_restores_cancelled_action() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        restore_cancelled_draft(&mut app, "cancelled action");
+        assert_eq!(app.prompt.input(), "cancelled action");
+
+        // Whitespace-only drafts are effectively empty.
+        app.prompt.set("   ");
+        restore_cancelled_draft(&mut app, "cancelled action");
+        assert_eq!(app.prompt.input(), "cancelled action");
+
+        app.prompt.set("typed during turn");
+        restore_cancelled_draft(&mut app, "cancelled action");
+        assert_eq!(
+            app.prompt.input(),
+            "typed during turn",
+            "cancel must not overwrite a newer draft"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_moves_home() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("look around");
+        idle(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.cursor(), 0);
+        assert_eq!(app.prompt.input(), "look around");
+    }
+
+    #[test]
+    fn ctrl_e_moves_end() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("look around");
+        app.prompt.move_home();
+        idle(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.cursor(), 11);
+    }
+
+    #[test]
+    fn ctrl_u_deletes_to_start() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("look around");
+        app.prompt.move_home();
+        app.prompt.move_right();
+        app.prompt.move_right();
+        idle(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.input(), "ok around");
+        assert_eq!(app.prompt.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_k_deletes_to_end() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("look around");
+        app.prompt.move_home();
+        app.prompt.move_right();
+        app.prompt.move_right();
+        idle(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.input(), "lo");
+        assert_eq!(app.prompt.cursor(), 2);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_back() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("attack the goblin");
+        idle(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.input(), "attack the ");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_at_cursor_and_does_not_quit_when_empty() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.set("look");
+        app.prompt.move_home();
+        idle(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.prompt.input(), "ook");
+        assert!(!app.should_quit);
+
+        app.prompt.clear();
+        idle(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit, "Ctrl+C is the explicit quit");
+    }
+
+    #[test]
+    fn ctrl_l_clears_scrollback() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.push_block(Block::Dm {
+            text: "A quiet room.".into(),
+        });
+        idle(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(app.scrollback.is_empty());
+    }
+
+    #[test]
+    fn plain_characters_are_not_treated_as_control() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        idle(&mut app, KeyCode::Char('a'), KeyModifiers::empty());
+        idle(&mut app, KeyCode::Char('e'), KeyModifiers::empty());
+        idle(&mut app, KeyCode::Char('w'), KeyModifiers::empty());
+        assert_eq!(app.prompt.input(), "aew");
+    }
+
+    #[test]
+    fn tab_completes_a_slash_command_before_toggling_focus() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.insert_str("/sa");
+        app.sync_completions();
+        idle(&mut app, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(app.prompt.input(), "/save ");
+        assert_eq!(app.focus, crate::ui::app::Focus::Prompt);
+    }
+
+    #[test]
+    fn tab_toggles_focus_only_when_the_prompt_is_empty() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.insert_str("draft");
+        idle(&mut app, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(
+            app.focus,
+            crate::ui::app::Focus::Prompt,
+            "Tab must not strand a draft in scrollback focus"
+        );
+        assert_eq!(app.prompt.input(), "draft");
+
+        app.prompt.clear();
+        idle(&mut app, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(app.focus, crate::ui::app::Focus::Scrollback);
+        idle(&mut app, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(app.focus, crate::ui::app::Focus::Prompt);
+    }
+
+    #[test]
+    fn esc_returns_from_scrollback_before_clearing() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.prompt.insert_str("draft");
+        app.toggle_focus();
+        idle(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert_eq!(app.focus, crate::ui::app::Focus::Prompt);
+        assert_eq!(app.prompt.input(), "draft");
+        idle(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert!(app.prompt.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ptt_release_marks_transcribing_and_ungates_input() {
+        let mut app = FullscreenApp::new("groknight", false, true);
+        app.ptt_held = true;
+        app.activity = Some("Listening".into());
+        mark_ptt_transcribing(&mut app);
+        assert!(!app.ptt_held);
+        assert_eq!(app.activity.as_deref(), Some("Transcribing…"));
+        // Keys are accepted even though the transcription task is still
+        // finishing (ptt itself stays Some in the caller until it resolves).
+        handle_idle_key(&mut app, key(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(app.prompt.input(), "a");
     }
 }

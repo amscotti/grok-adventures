@@ -21,6 +21,7 @@ use crossterm::{execute, queue};
 
 use crate::ui::completion::{CompletionMenu, MAX_VISIBLE, suggestion_line};
 use crate::ui::prompt::{Prompt, PromptHistory};
+use crate::ui::sanitize;
 use crate::ui::theme;
 
 const MENU_HINT: &str = "  tab complete · ↑/↓ choose · esc dismiss";
@@ -55,7 +56,10 @@ impl LineEditor {
     /// `Ok(None)` means EOF: Ctrl+D or Ctrl+C on an empty line.
     pub fn read_line(&mut self, initial: &str) -> Result<Option<String>> {
         let mut prompt = Prompt::new();
-        prompt.set(initial);
+        // STT edit-before-send prefills the editor with a transcript; keep
+        // control/escape sequences out of the buffer so they cannot be
+        // echoed to the terminal by `View::draw`.
+        prompt.set(sanitize::sanitize_terminal_line(initial));
         let mut menu = CompletionMenu::new();
         menu.update(prompt.input(), prompt.cursor());
         let mut view = View::default();

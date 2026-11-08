@@ -1,6 +1,7 @@
 //! Grok Adventures — Grok is the DM, Rust is the rules engine.
 
 pub mod config;
+pub mod demo;
 pub mod dm;
 pub mod game;
 pub mod io;

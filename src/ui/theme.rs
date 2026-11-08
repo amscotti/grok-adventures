@@ -1,8 +1,26 @@
 //! GrokNight theme helpers via `owo-colors`.
 //!
 //! All helpers respect `NO_COLOR` (when set and non-empty, colors are disabled).
+//!
+//! Minimal mode is dark-terminal only. The palette below is tuned for a
+//! near-black background (`#12131a`); WCAG AA contrast ratios against that
+//! background are:
+//!
+//! - player accent `#c8a0ff` — 8.76:1
+//! - DM narration `#8ccdff` — 10.84:1
+//! - tools `#ffcd6e` — 12.53:1
+//! - error `#ff8787` — 8.00:1
+//! - success `#82e1a0` — 11.67:1
+//! - muted `#aaaeb9` — 8.35:1 (was dimmed DarkGray, ~3.5:1)
 
 use owo_colors::{OwoColorize, Style};
+
+/// RGB for healthy HP (also the dark-theme success accent).
+const HP_HIGH: (u8, u8, u8) = (130, 225, 160);
+/// RGB for wounded HP.
+const HP_MID: (u8, u8, u8) = (255, 205, 110);
+/// RGB for critical HP.
+const HP_LOW: (u8, u8, u8) = (255, 135, 135);
 
 /// Whether ANSI color should be emitted.
 pub fn colors_enabled() -> bool {
@@ -20,32 +38,32 @@ pub fn paint(text: &str, style: Style) -> String {
 
 /// Player accent (magenta / cyan family for GrokNight).
 pub fn player_style() -> Style {
-    Style::new().fg_rgb::<180, 120, 255>().bold()
+    Style::new().fg_rgb::<200, 160, 255>().bold()
 }
 
 /// DM narration accent.
 pub fn dm_style() -> Style {
-    Style::new().fg_rgb::<140, 200, 255>()
+    Style::new().fg_rgb::<140, 205, 255>()
 }
 
 /// Tool / mechanics accent.
 pub fn tool_style() -> Style {
-    Style::new().fg_rgb::<255, 200, 100>().dimmed()
+    Style::new().fg_rgb::<255, 205, 110>()
 }
 
 /// Error accent.
 pub fn error_style() -> Style {
-    Style::new().fg_rgb::<255, 90, 90>().bold()
+    Style::new().fg_rgb::<255, 135, 135>().bold()
 }
 
 /// Success accent.
 pub fn success_style() -> Style {
-    Style::new().fg_rgb::<100, 220, 140>()
+    Style::new().fg_rgb::<130, 225, 160>()
 }
 
 /// Muted secondary text.
 pub fn muted() -> Style {
-    Style::new().dimmed()
+    Style::new().fg_rgb::<170, 174, 185>()
 }
 
 /// Style for primary body text.
@@ -54,18 +72,24 @@ pub fn primary() -> Style {
 }
 
 /// HP color by percentage of max: green ≥50%, yellow ≥25%, red otherwise.
-pub fn hp_color(hp: i32, max_hp: i32) -> Style {
+pub fn hp_rgb(hp: i32, max_hp: i32) -> (u8, u8, u8) {
     if max_hp <= 0 {
-        return Style::new().fg_rgb::<255, 90, 90>();
+        return HP_LOW;
     }
     let pct = (hp as f64 / max_hp as f64 * 100.0) as i32;
     if pct >= 50 {
-        Style::new().fg_rgb::<100, 220, 140>()
+        HP_HIGH
     } else if pct >= 25 {
-        Style::new().fg_rgb::<255, 200, 80>()
+        HP_MID
     } else {
-        Style::new().fg_rgb::<255, 90, 90>()
+        HP_LOW
     }
+}
+
+/// HP color by percentage of max: green ≥50%, yellow ≥25%, red otherwise.
+pub fn hp_color(hp: i32, max_hp: i32) -> Style {
+    let (r, g, b) = hp_rgb(hp, max_hp);
+    Style::new().truecolor(r, g, b)
 }
 
 /// Convenience: paint with player style.
@@ -115,6 +139,10 @@ mod tests {
         let _y = paint("8/20", hp_color(8, 20));
         let _r = paint("2/20", hp_color(2, 20));
         let _dead = paint("0/0", hp_color(0, 0));
+        assert_eq!(hp_rgb(20, 20), HP_HIGH);
+        assert_eq!(hp_rgb(8, 20), HP_MID);
+        assert_eq!(hp_rgb(2, 20), HP_LOW);
+        assert_eq!(hp_rgb(0, 0), HP_LOW);
     }
 
     #[test]

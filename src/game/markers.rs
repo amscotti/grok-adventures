@@ -137,12 +137,22 @@ fn process_remove_items(state: &mut GameState, text: &str) -> String {
         .into_owned()
 }
 
+/// Parse a marker's digit string, clamping values too large for `i32`
+/// instead of silently treating them as zero.
+fn marker_amount(raw: &str) -> i32 {
+    raw.parse::<i64>()
+        .map(|n| n.clamp(0, i64::from(i32::MAX)) as i32)
+        .unwrap_or(i32::MAX)
+}
+
 fn process_damage(state: &mut GameState, text: &str) -> String {
     DAMAGE_PATTERN
         .replace_all(text, |caps: &regex::Captures| {
-            let amount: i32 = caps[1].parse().unwrap_or(0);
+            let amount = marker_amount(&caps[1]);
+            let old_hp = state.hp;
             state.modify_hp(-amount);
-            format!("**💔 -{amount} HP ({}/{})**", state.hp, state.max_hp)
+            let applied = (i64::from(old_hp) - i64::from(state.hp)).max(0);
+            format!("**💔 -{applied} HP ({}/{})**", state.hp, state.max_hp)
         })
         .into_owned()
 }
@@ -150,9 +160,11 @@ fn process_damage(state: &mut GameState, text: &str) -> String {
 fn process_healing(state: &mut GameState, text: &str) -> String {
     HEAL_PATTERN
         .replace_all(text, |caps: &regex::Captures| {
-            let amount: i32 = caps[1].parse().unwrap_or(0);
+            let amount = marker_amount(&caps[1]);
+            let old_hp = state.hp;
             state.modify_hp(amount);
-            format!("**💚 +{amount} HP ({}/{})**", state.hp, state.max_hp)
+            let applied = (i64::from(state.hp) - i64::from(old_hp)).max(0);
+            format!("**💚 +{applied} HP ({}/{})**", state.hp, state.max_hp)
         })
         .into_owned()
 }
@@ -325,5 +337,30 @@ mod tests {
         let out = process(&mut state, "[ROLL:1d6-1]");
         assert!(out.contains("1d6-1"));
         assert!(out.contains("🎲"));
+    }
+
+    #[test]
+    fn huge_markers_clamp_without_panicking() {
+        let mut state = fresh();
+        let out = process(
+            &mut state,
+            "The world ends. [DAMAGE:999999999999999999999999]",
+        );
+        assert_eq!(state.hp, 0);
+        assert!(out.contains("-20 HP"), "{out}");
+
+        let out = process(&mut state, "[HEAL:999999999999999999999999]");
+        assert_eq!(state.hp, 20);
+        assert!(out.contains("+20 HP"), "{out}");
+    }
+
+    #[test]
+    fn heal_marker_reports_effective_delta_at_full_hp() {
+        let mut state = fresh();
+        assert_eq!(state.hp, 20);
+        let out = process(&mut state, "[HEAL:5]");
+        assert_eq!(state.hp, 20);
+        assert!(out.contains("+0 HP (20/20)"), "{out}");
+        assert!(!out.contains("+5 HP"), "{out}");
     }
 }

@@ -18,9 +18,10 @@ pub struct StateSnapshot {
 
 impl From<&GameState> for StateSnapshot {
     fn from(state: &GameState) -> Self {
-        let mut items = BTreeMap::new();
+        let mut items: BTreeMap<String, i32> = BTreeMap::new();
         for item in &state.inventory {
-            *items.entry(item.name.clone()).or_insert(0) += item.quantity;
+            let total = items.entry(item.name.clone()).or_insert(0);
+            *total = (*total).saturating_add(item.quantity);
         }
         Self {
             hp: state.hp,
@@ -39,7 +40,7 @@ pub fn describe_deltas(before: &StateSnapshot, after: &GameState) -> Vec<String>
     let mut lines = Vec::new();
 
     if after.hp != before.hp {
-        let delta = after.hp - before.hp;
+        let delta = i64::from(after.hp) - i64::from(before.hp);
         if delta < 0 {
             lines.push(format!("💔 {delta} HP ({}/{})", after.hp, after.max_hp));
         } else {
@@ -54,8 +55,8 @@ pub fn describe_deltas(before: &StateSnapshot, after: &GameState) -> Vec<String>
     // Inventory adds (new items or quantity increases).
     for (name, after_qty) in &after.items {
         let before_qty = before.items.get(name).copied().unwrap_or(0);
-        if *after_qty > before_qty {
-            let gained = *after_qty - before_qty;
+        let gained = (*after_qty).saturating_sub(before_qty);
+        if gained > 0 {
             if before_qty == 0 && gained == 1 {
                 lines.push(format!("🎒 +{name}"));
             } else {
@@ -67,8 +68,8 @@ pub fn describe_deltas(before: &StateSnapshot, after: &GameState) -> Vec<String>
     // Inventory removals (gone or quantity decreases).
     for (name, before_qty) in &before.items {
         let after_qty = after.items.get(name).copied().unwrap_or(0);
-        if after_qty < *before_qty {
-            let lost = *before_qty - after_qty;
+        let lost = (*before_qty).saturating_sub(after_qty);
+        if lost > 0 {
             if after_qty == 0 && lost == 1 {
                 lines.push(format!("🎒 -{name}"));
             } else {
@@ -172,5 +173,34 @@ mod tests {
         state.add_item("Potion", "red", 3);
         let snap = StateSnapshot::from(&state);
         assert_eq!(snap.items.get("Potion"), Some(&5));
+    }
+
+    #[test]
+    fn snapshot_quantity_sum_saturates() {
+        let mut state = GameState::new("Hero");
+        state.inventory.push(crate::game::state::InventoryItem::new(
+            "Gold",
+            "coins",
+            i32::MAX,
+        ));
+        state.inventory.push(crate::game::state::InventoryItem::new(
+            "Gold",
+            "more coins",
+            i32::MAX,
+        ));
+        let snap = StateSnapshot::from(&state);
+        // The per-key sum must saturate instead of wrapping.
+        assert_eq!(snap.items.get("Gold"), Some(&i32::MAX));
+    }
+
+    #[test]
+    fn hp_delta_handles_extreme_values() {
+        let state = GameState::new("Hero");
+        let mut before = StateSnapshot::from(&state);
+        before.hp = i32::MIN;
+        let mut after = GameState::new("Hero");
+        after.hp = i32::MAX;
+        let lines = describe_deltas(&before, &after);
+        assert_eq!(lines, vec!["💚 +4294967295 HP (2147483647/20)".to_string()]);
     }
 }
