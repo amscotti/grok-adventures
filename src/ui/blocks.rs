@@ -1,6 +1,7 @@
 //! Block model and minimal linear rendering.
 
 use crate::ui::markdown;
+use crate::ui::sanitize;
 use crate::ui::theme;
 
 /// Kind of system message.
@@ -35,6 +36,7 @@ pub fn format_block(block: &Block, tools_expanded: bool) -> String {
     match block {
         Block::Player { text, spoken } => {
             let label = if *spoken { "You · voice" } else { "You" };
+            let text = sanitize::sanitize_terminal_text(text);
             let mut out = theme::player(label);
             out.push('\n');
             for line in text.lines() {
@@ -76,11 +78,16 @@ pub fn format_block(block: &Block, tools_expanded: bool) -> String {
             }
             out
         }
-        Block::System { text, kind } => match kind {
-            SystemKind::Info => theme::dim(text),
-            SystemKind::Error => theme::error(text),
-            SystemKind::Success => theme::success(text),
-        },
+        Block::System { text, kind } => {
+            // Style the sanitized source, never the other way around: theme
+            // helpers add legitimate ANSI codes that must survive.
+            let text = sanitize::sanitize_terminal_text(text);
+            match kind {
+                SystemKind::Info => theme::dim(&text),
+                SystemKind::Error => theme::error(&text),
+                SystemKind::Success => theme::success(&text),
+            }
+        }
         Block::Dice { text } => markdown::render_inline(text),
     }
 }
@@ -92,15 +99,19 @@ fn format_tools(calls: &[ToolCallView], expanded: bool) -> String {
     let header = theme::tool(&format!("Tools ({})", calls.len()));
     if !expanded {
         // Collapsed: one summary line listing names
-        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<String> = calls
+            .iter()
+            .map(|c| sanitize::sanitize_terminal_text(&c.name))
+            .collect();
         return format!("{header}\n  {}", theme::dim(&names.join(", ")));
     }
     let mut out = header;
     for call in calls {
+        let name = sanitize::sanitize_terminal_text(&call.name);
         let summary = markdown::truncate_chars(&call.result_summary, 80);
         out.push('\n');
         out.push_str("  · ");
-        out.push_str(&theme::tool(&call.name));
+        out.push_str(&theme::tool(&name));
         out.push_str(" → ");
         out.push_str(&theme::dim(&summary));
     }
@@ -115,12 +126,15 @@ pub fn print_block(block: &Block, tools_expanded: bool) {
 
 /// Plain lines for the session header: title + version, then detail and hint.
 pub fn session_header_lines(title: &str, detail: &str, hint: &str) -> Vec<String> {
+    let title = sanitize::sanitize_terminal_text(title);
+    let detail = sanitize::sanitize_terminal_text(detail);
+    let hint = sanitize::sanitize_terminal_text(hint);
     let mut lines = vec![format!("{title}  v{}", env!("CARGO_PKG_VERSION"))];
     if !detail.is_empty() {
-        lines.push(detail.to_string());
+        lines.push(detail);
     }
     if !hint.is_empty() {
-        lines.push(hint.to_string());
+        lines.push(hint);
     }
     lines
 }
@@ -132,7 +146,7 @@ pub fn print_session_header(title: &str, detail: &str, hint: &str) {
     if lines.next().is_some() {
         println!(
             "{}  {}",
-            theme::player(title),
+            theme::player(&sanitize::sanitize_terminal_text(title)),
             theme::dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         );
     }
@@ -226,5 +240,95 @@ mod tests {
             false,
         );
         assert!(err.contains("boom"));
+    }
+
+    /// Payload containing an OSC 52 clipboard write, CSI clear-screen,
+    /// window-title escape, BEL, bidi override/isolate, and zero-width chars.
+    const HOSTILE: &str =
+        "\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J\x1b]0;owned\x07\u{202e}\u{2067}\u{200b}";
+
+    fn assert_payload_removed(rendered: &str) {
+        assert!(!rendered.contains("\x1b]"), "OSC survived: {rendered:?}");
+        assert!(
+            !rendered.contains("52;c"),
+            "OSC payload survived: {rendered:?}"
+        );
+        assert!(!rendered.contains("\x1b[2J"), "CSI survived: {rendered:?}");
+        assert!(!rendered.contains('\x07'), "BEL survived: {rendered:?}");
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "bidi survived: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{2067}'),
+            "bidi isolate survived: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{200b}'),
+            "zero-width survived: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_player_text_is_neutralized() {
+        let rendered = format_block(
+            &Block::Player {
+                text: format!("search {HOSTILE} the room"),
+                spoken: false,
+            },
+            false,
+        );
+        assert_payload_removed(&rendered);
+        assert!(rendered.contains("search"));
+        assert!(rendered.contains("the room"));
+    }
+
+    #[test]
+    fn hostile_dm_text_keeps_bold_styling() {
+        let rendered = format_block(
+            &Block::Dm {
+                text: format!("A **dark** hall. {HOSTILE}"),
+            },
+            false,
+        );
+        assert_payload_removed(&rendered);
+        assert!(rendered.contains("dark"));
+        assert!(!rendered.contains("**dark**"));
+    }
+
+    #[test]
+    fn hostile_system_and_tools_text_is_neutralized() {
+        let system = format_block(
+            &Block::System {
+                text: format!("error {HOSTILE} line"),
+                kind: SystemKind::Error,
+            },
+            false,
+        );
+        assert_payload_removed(&system);
+        assert!(system.contains("error") && system.contains("line"));
+
+        let tools = Block::Tools {
+            calls: vec![ToolCallView {
+                name: format!("roll{HOSTILE}"),
+                result_summary: format!("14 {HOSTILE}"),
+            }],
+        };
+        for expanded in [false, true] {
+            let rendered = format_block(&tools, expanded);
+            assert_payload_removed(&rendered);
+        }
+    }
+
+    #[test]
+    fn hostile_session_header_is_neutralized() {
+        let lines = session_header_lines(
+            &format!("Title{HOSTILE}"),
+            &format!("detail {HOSTILE}"),
+            &format!("hint {HOSTILE}"),
+        );
+        for line in lines {
+            assert_payload_removed(&line);
+        }
     }
 }

@@ -3,12 +3,14 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use grok_adventures::config::Config;
+use grok_adventures::demo;
 use grok_adventures::game::loop_::GameLoop;
 use grok_adventures::game::player_agent::PlayerStyle;
 use grok_adventures::game::save::SaveGame;
 use grok_adventures::game::state::{ClassKit, GameState};
 use grok_adventures::ui::UiMode;
 use grok_adventures::ui::creation;
+use grok_adventures::ui::sanitize::sanitize_terminal_line;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -30,6 +32,10 @@ struct Cli {
     /// Load a save slot name or path
     #[arg(long)]
     load: Option<String>,
+
+    /// Show a deterministic offline demo (no API key, no network) and exit
+    #[arg(long, conflicts_with_all = ["autopilot", "load"])]
+    demo: bool,
 
     /// Force minimal (linear) UI
     #[arg(long)]
@@ -72,6 +78,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Offline showcase: exit before .env, config, tracing, or the API-key
+    // check, and without touching the network. Always minimal and short.
+    if cli.demo {
+        print!("{}", demo::render_demo());
+        return Ok(());
+    }
+
     // Load .env if present (local XAI_API_KEY); ignore missing file.
     let _ = dotenvy::dotenv();
 
@@ -82,7 +97,6 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
     let mut config = Config::load(&cli.config).context("loading config")?;
 
     if cli.no_tts {
@@ -117,8 +131,8 @@ async fn main() -> Result<()> {
         let mut state = GameState::new(name);
         if let Some(kit) = resolve_character_class(&cli, interactive)? {
             match state.apply_class_kit(kit.key) {
-                Ok(msg) => println!("{msg}"),
-                Err(e) => eprintln!("Class kit skipped: {e}"),
+                Ok(msg) => println!("{}", sanitize_terminal_line(&msg)),
+                Err(e) => eprintln!("Class kit skipped: {}", sanitize_terminal_line(&e)),
             }
         }
         if interactive {
@@ -130,7 +144,8 @@ async fn main() -> Result<()> {
     if cli.autopilot {
         let scripted = cli.scripted_autopilot || scripted_autopilot_env();
         let style = resolve_player_style(&cli)?;
-        GameLoop::run_autopilot_with_style(&mut state, &config, cli.turns, scripted, style).await?;
+        GameLoop::run_autopilot_with_style(&mut state, &config, cli.turns, scripted, resume, style)
+            .await?;
     } else {
         GameLoop::run_interactive(&mut state, &config, resume).await?;
     }
@@ -150,7 +165,10 @@ fn scripted_autopilot_env() -> bool {
 fn resolve_player_style(cli: &Cli) -> Result<PlayerStyle> {
     if let Some(ref s) = cli.player_style {
         return PlayerStyle::parse(s).ok_or_else(|| {
-            anyhow::anyhow!("invalid --player-style '{s}' (expected cautious|balanced|reckless)")
+            anyhow::anyhow!(
+                "invalid --player-style '{}' (expected cautious|balanced|reckless)",
+                sanitize_terminal_line(s)
+            )
         });
     }
     Ok(PlayerStyle::from_env())

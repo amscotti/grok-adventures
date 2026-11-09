@@ -15,6 +15,30 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
+/// TCP/TLS/websocket connect budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Budget for the server's `transcript.created` handshake message.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for any channel or websocket send. A peer that stops reading must
+/// not stall capture/finalization forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of a bounded channel send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    Closed,
+    TimedOut,
+}
+
+async fn send_bounded<T>(tx: &mpsc::Sender<T>, value: T, limit: Duration) -> SendOutcome {
+    match tokio::time::timeout(limit, tx.send(value)).await {
+        Ok(Ok(())) => SendOutcome::Sent,
+        Ok(Err(_)) => SendOutcome::Closed,
+        Err(_) => SendOutcome::TimedOut,
+    }
+}
+
 /// Rates the streaming API accepts for raw PCM.
 pub fn streaming_rate_supported(rate: u32) -> bool {
     matches!(rate, 8000 | 16_000 | 22_050 | 24_000 | 44_100 | 48_000)
@@ -153,13 +177,11 @@ impl SttStream {
                 .context("STT auth header")?,
         );
 
-        let (ws, _) = tokio::time::timeout(
-            Duration::from_secs(15),
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        .context("STT websocket connect timed out")?
-        .context("STT websocket connect")?;
+        let (ws, _) =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+                .await
+                .context("STT websocket connect timed out")?
+                .context("STT websocket connect")?;
 
         let (mut ws_write, mut ws_read) = ws.split();
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -167,13 +189,25 @@ impl SttStream {
 
         let writer = tokio::spawn(async move {
             while let Some(chunk) = audio_rx.recv().await {
-                if ws_write.send(Message::Binary(chunk.into())).await.is_err() {
-                    return;
+                match tokio::time::timeout(
+                    SEND_TIMEOUT,
+                    ws_write.send(Message::Binary(chunk.into())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        tracing::warn!("streaming STT websocket send timed out");
+                        return;
+                    }
                 }
             }
-            let _ = ws_write
-                .send(Message::Text(r#"{"type":"audio.done"}"#.into()))
-                .await;
+            let _ = tokio::time::timeout(
+                SEND_TIMEOUT,
+                ws_write.send(Message::Text(r#"{"type":"audio.done"}"#.into())),
+            )
+            .await;
         });
 
         let reader = tokio::spawn(async move {
@@ -182,7 +216,8 @@ impl SttStream {
                     Some(Ok(Message::Text(text))) => {
                         let event = parse_server_event(&text);
                         if let Some(event) = event
-                            && event_tx.send(event).await.is_err()
+                            && send_bounded(&event_tx, event, SEND_TIMEOUT).await
+                                != SendOutcome::Sent
                         {
                             break;
                         }
@@ -190,11 +225,14 @@ impl SttStream {
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
                         if !is_benign_disconnect(&err) {
-                            let _ = event_tx
-                                .send(SttStreamEvent::Error {
+                            let _ = send_bounded(
+                                &event_tx,
+                                SttStreamEvent::Error {
                                     message: err.to_string(),
-                                })
-                                .await;
+                                },
+                                SEND_TIMEOUT,
+                            )
+                            .await;
                         }
                         break;
                     }
@@ -209,7 +247,7 @@ impl SttStream {
             writer,
             reader,
         };
-        match tokio::time::timeout(Duration::from_secs(10), session.event_rx.recv()).await {
+        match tokio::time::timeout(READY_TIMEOUT, session.event_rx.recv()).await {
             Ok(Some(SttStreamEvent::Ready)) => Ok(session),
             Ok(Some(SttStreamEvent::Error { message })) => {
                 bail!("streaming STT: {message}");
@@ -224,10 +262,14 @@ impl SttStream {
         let Some(tx) = &self.audio_tx else {
             bail!("streaming STT audio channel is closed");
         };
-        tx.send(bytes)
-            .await
-            .context("streaming STT audio channel closed")?;
-        Ok(())
+        match send_bounded(tx, bytes, SEND_TIMEOUT).await {
+            SendOutcome::Sent => Ok(()),
+            SendOutcome::Closed => bail!("streaming STT audio channel closed"),
+            SendOutcome::TimedOut => bail!(
+                "timed out after {}s sending audio to streaming STT",
+                SEND_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     pub fn poll(&mut self) -> StreamPoll {
@@ -380,6 +422,37 @@ mod tests {
         assert_eq!(
             parse_server_event(r#"{"type":"transcript.created"}"#),
             Some(SttStreamEvent::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_send_succeeds_with_capacity() {
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+        let outcome = send_bounded(&tx, 7, std::time::Duration::from_millis(50)).await;
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert_eq!(rx.recv().await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn bounded_send_reports_closed_channel() {
+        let (tx, rx) = mpsc::channel::<u8>(1);
+        drop(rx);
+        let outcome = send_bounded(&tx, 7, std::time::Duration::from_millis(50)).await;
+        assert_eq!(outcome, SendOutcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn bounded_send_times_out_when_peer_stops_reading() {
+        let (tx, _rx) = mpsc::channel::<u8>(1);
+        let limit = std::time::Duration::from_millis(50);
+        assert_eq!(send_bounded(&tx, 1, limit).await, SendOutcome::Sent);
+
+        let started = std::time::Instant::now();
+        let outcome = send_bounded(&tx, 2, limit).await;
+        assert_eq!(outcome, SendOutcome::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "bounded send did not respect its timeout"
         );
     }
 }

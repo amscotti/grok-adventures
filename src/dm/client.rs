@@ -9,9 +9,11 @@
 //! turns; put authoritative game state in the (dynamic) system prompt body.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -19,16 +21,26 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{DEFAULT_DM_MODEL, DEFAULT_REASONING_EFFORT};
 use crate::game::state::GameState;
 use crate::game::tools;
-use crate::util::http::api_client;
+use crate::util::http::{api_client, read_text_bounded};
 use crate::util::message_content::deserialize_message_content;
+use crate::util::redact::redact_secrets;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 /// One chat hop. High/xhigh reasoning can think for a while; this is the
 /// ceiling for a single request, not the whole turn.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_TOOL_ITERATIONS: usize = 10;
+/// Hard cap on tool calls executed from one assistant response. Extra calls
+/// still receive an error `role: tool` message so the protocol stays valid.
+const MAX_TOOL_CALLS_PER_RESPONSE: usize = 32;
+/// Total HTTP attempts (initial try + retries) for transient failures.
+const MAX_HTTP_ATTEMPTS: u32 = 3;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 /// Soft cap on retained multi-turn history content (user + assistant text).
 const HISTORY_MAX_CHARS: usize = 8_000;
+/// Hard cap on one chat-completions response body (2 MiB).
+const MAX_CHAT_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Error message returned when a turn is cancelled mid-flight.
 pub const TURN_CANCELLED_MSG: &str = "turn cancelled";
@@ -52,6 +64,9 @@ pub struct UsageTotals {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Chat-completion requests that returned a response (tool hops included,
+    /// even if the API omitted the usage block).
+    pub requests: u32,
 }
 
 impl UsageTotals {
@@ -59,6 +74,7 @@ impl UsageTotals {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.total_tokens += other.total_tokens;
+        self.requests += other.requests;
     }
 }
 
@@ -150,7 +166,7 @@ impl ChatHistory {
 }
 
 /// HTTP client for Grok chat completions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DmClient {
     client: reqwest::Client,
     api_key: String,
@@ -160,6 +176,19 @@ pub struct DmClient {
     base_url: String,
     /// Optional conversation id for xAI prompt-cache routing (`x-grok-conv-id`).
     conv_id: Option<String>,
+}
+
+impl fmt::Debug for DmClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmClient")
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("base_url", &self.base_url)
+            .field("conv_id", &self.conv_id)
+            .finish()
+    }
 }
 
 impl DmClient {
@@ -219,7 +248,9 @@ impl DmClient {
     /// Run a full tool-calling loop for one player action.
     ///
     /// `system` is the full system prompt (static + dynamic). `user` is the
-    /// player action text. Mutating tool handlers update `state` in place.
+    /// player action text. Tool handlers run against a working copy of
+    /// `state`; changes are committed only when the model produces final
+    /// narration. A failed or cancelled turn leaves `state` untouched.
     /// Does not append to `history` — callers should [`ChatHistory::push`]
     /// after a successful turn.
     pub async fn query(
@@ -239,8 +270,9 @@ impl DmClient {
     /// `cancel.cancelled()`. On cancel returns an error whose message is
     /// [`TURN_CANCELLED_MSG`] (see [`is_turn_cancelled`]).
     ///
-    /// **Note:** tools already executed before cancel may have mutated
-    /// `state`. Callers that need clean cancel should snapshot and restore.
+    /// The turn is transactional: tool calls mutate a working copy of `state`
+    /// and the copy is committed only after the model returns final narration.
+    /// Errors and cancellation leave the caller's state untouched.
     pub async fn query_cancellable(
         &self,
         system: &str,
@@ -260,79 +292,50 @@ impl DmClient {
         let mut all_tool_calls: Vec<ToolCallRecord> = Vec::new();
         let mut mutating = false;
         let mut usage = UsageTotals::default();
-        let mut final_text = String::new();
+        let mut final_text: Option<String> = None;
+
+        // Transaction boundary: tools mutate `working`, never the caller's
+        // state. Commit happens exactly once, after final narration arrives.
+        let mut working = state.clone();
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
             check_cancelled(cancel.as_ref())?;
 
             let body = completion_body(&self.model, &self.reasoning_effort, &messages, &tools, 0.7);
-
-            let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-            let mut request = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .header("Content-Type", "application/json");
-            if let Some(ref id) = self.conv_id {
-                request = request.header("x-grok-conv-id", id);
-            }
-            let request = request.json(&body);
-
-            let resp = match cancel.as_ref() {
-                Some(token) => {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => {
-                            bail!(TURN_CANCELLED_MSG);
-                        }
-                        resp = request.send() => {
-                            resp.with_context(|| {
-                                format!("xAI chat request failed (iter {iteration})")
-                            })?
-                        }
-                    }
-                }
-                None => request
-                    .send()
-                    .await
-                    .with_context(|| format!("xAI chat request failed (iter {iteration})"))?,
-            };
+            let resp = self
+                .send_with_retries(&url, &body, cancel.as_ref(), iteration)
+                .await?;
 
             check_cancelled(cancel.as_ref())?;
 
             let status = resp.status();
-            let resp_text = match cancel.as_ref() {
-                Some(token) => {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => {
-                            bail!(TURN_CANCELLED_MSG);
-                        }
-                        text = resp.text() => {
-                            text.context("reading xAI response body")?
-                        }
-                    }
-                }
-                None => resp.text().await.context("reading xAI response body")?,
-            };
+            let resp_text = read_response_body(resp, cancel.as_ref()).await?;
 
             if !status.is_success() {
-                bail!("xAI API error {status}: {}", truncate_err(&resp_text, 500));
+                bail!(
+                    "xAI API error {status}: {}",
+                    truncate_err(&redact_secrets(&resp_text), 500)
+                );
             }
 
             let parsed: ChatCompletionResponse =
                 serde_json::from_str(&resp_text).with_context(|| {
                     format!(
                         "parsing xAI chat response: {}",
-                        truncate_err(&resp_text, 300)
+                        truncate_err(&redact_secrets(&resp_text), 300)
                     )
                 })?;
 
+            // Count the response even when the API omits its usage block: the
+            // request was made, and tool hops each add another round trip.
+            usage.requests += 1;
             if let Some(u) = parsed.usage {
                 usage.add(&UsageTotals {
                     prompt_tokens: u.prompt_tokens.unwrap_or(0),
                     completion_tokens: u.completion_tokens.unwrap_or(0),
                     total_tokens: u.total_tokens.unwrap_or(0),
+                    requests: 0,
                 });
             }
 
@@ -357,19 +360,38 @@ impl DmClient {
 
             let tool_calls = message.tool_calls.unwrap_or_default();
             if tool_calls.is_empty() {
-                final_text = message.content.unwrap_or_default();
+                final_text = Some(message.content.unwrap_or_default());
                 break;
             }
 
-            for tc in tool_calls {
+            for (index, tc) in tool_calls.into_iter().enumerate() {
                 check_cancelled(cancel.as_ref())?;
                 let name = tc.function.name.clone();
                 let args_str = tc.function.arguments.clone();
-                let args: Value = serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
-                let result = tools::dispatch(state, &name, &args);
-                if tools::is_mutating(&name) {
+
+                let result = if index >= MAX_TOOL_CALLS_PER_RESPONSE {
+                    tools::ToolResult::err(format!(
+                        "❌ Too many tool calls in one response (max \
+                         {MAX_TOOL_CALLS_PER_RESPONSE}); '{name}' was not executed."
+                    ))
+                } else {
+                    match parse_tool_args(&args_str) {
+                        // Malformed args must never execute the tool: a
+                        // fallback to `{}` would silently run zero-arg tools
+                        // like advance_turn / end_combat.
+                        Ok(args) => tools::dispatch(&mut working, &name, &args),
+                        Err(reason) => tools::ToolResult::err(format!(
+                            "❌ Invalid arguments for tool '{name}': {reason}"
+                        )),
+                    }
+                };
+
+                // A failed mutation changed nothing; it must not disable the
+                // marker safety net (e.g. failed modify_hp + [DAMAGE:5]).
+                if !result.is_error && tools::is_mutating(&name) {
                     mutating = true;
                 }
+
                 let content = result.content;
                 all_tool_calls.push(ToolCallRecord {
                     name: name.clone(),
@@ -384,9 +406,18 @@ impl DmClient {
             }
         }
 
+        let Some(mut final_text) = final_text else {
+            bail!("DM turn exceeded {MAX_TOOL_ITERATIONS} tool iterations without final narration");
+        };
+
         if final_text.is_empty() && !all_tool_calls.is_empty() {
             final_text = "(The DM finished tool work but returned no narration.)".to_string();
         }
+
+        // Close the commit window: cancellation observed before this point
+        // still rolls the whole turn back.
+        check_cancelled(cancel.as_ref())?;
+        *state = working;
 
         Ok(TurnResult {
             text: final_text,
@@ -394,6 +425,69 @@ impl DmClient {
             mutating_tool_ran: mutating,
             usage,
         })
+    }
+
+    /// POST one chat-completions body, retrying transient failures.
+    ///
+    /// Retries 429/500/502/503/504 and connection errors up to
+    /// [`MAX_HTTP_ATTEMPTS`] total attempts with exponential backoff.
+    /// `Retry-After` (integer seconds) overrides the backoff, capped at
+    /// [`RETRY_MAX_DELAY`]. Auth/validation 4xx responses are returned
+    /// immediately for the caller to report.
+    async fn send_with_retries(
+        &self,
+        url: &str,
+        body: &Value,
+        cancel: Option<&CancellationToken>,
+        iteration: usize,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            check_cancelled(cancel)?;
+
+            let mut request = self
+                .client
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .header("Content-Type", "application/json");
+            if let Some(ref id) = self.conv_id {
+                request = request.header("x-grok-conv-id", id);
+            }
+            let request = request.json(body);
+
+            let sent = match cancel {
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => bail!(TURN_CANCELLED_MSG),
+                        resp = request.send() => resp,
+                    }
+                }
+                None => request.send().await,
+            };
+
+            match sent {
+                Ok(resp) => {
+                    if is_retryable_status(resp.status()) && attempt + 1 < MAX_HTTP_ATTEMPTS {
+                        let delay = retry_delay(resp.headers(), attempt);
+                        drop(resp);
+                        sleep_or_cancel(delay, cancel).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(err) => {
+                    if err.is_connect() && attempt + 1 < MAX_HTTP_ATTEMPTS {
+                        sleep_or_cancel(exponential_backoff(attempt), cancel).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(err)
+                        .with_context(|| format!("xAI chat request failed (iter {iteration})"));
+                }
+            }
+        }
     }
 }
 
@@ -432,6 +526,75 @@ fn check_cancelled(cancel: Option<&CancellationToken>) -> Result<()> {
         bail!(TURN_CANCELLED_MSG);
     }
     Ok(())
+}
+
+/// Read a response body, aborting promptly if the turn is cancelled.
+async fn read_response_body(
+    resp: reqwest::Response,
+    cancel: Option<&CancellationToken>,
+) -> Result<String> {
+    let read = read_text_bounded(resp, MAX_CHAT_BODY_BYTES, "xAI chat");
+    match cancel {
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => bail!(TURN_CANCELLED_MSG),
+            text = read => text,
+        },
+        None => read.await,
+    }
+}
+
+/// Parse tool-call arguments without a `{}` fallback.
+///
+/// The fallback used to execute zero-argument tools (advance_turn,
+/// end_combat, ...) on malformed model output. Reject instead so the model
+/// receives an error tool result and can retry with valid JSON.
+fn parse_tool_args(raw: &str) -> std::result::Result<Value, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|err| format!("invalid JSON ({err})"))?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err("expected a JSON object".to_string())
+    }
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff: 250ms, 500ms, 1s, ... capped at [`RETRY_MAX_DELAY`].
+fn exponential_backoff(attempt: u32) -> Duration {
+    let factor = 1u32 << attempt.min(4);
+    (RETRY_BASE_DELAY * factor).min(RETRY_MAX_DELAY)
+}
+
+/// Delay before the next attempt: `Retry-After` seconds when the server sent
+/// one (capped at [`RETRY_MAX_DELAY`]), otherwise exponential backoff.
+fn retry_delay(headers: &HeaderMap, attempt: u32) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.min(RETRY_MAX_DELAY.as_secs())))
+        .unwrap_or_else(|| exponential_backoff(attempt))
+}
+
+/// Sleep between retries, but wake immediately when the turn is cancelled.
+async fn sleep_or_cancel(delay: Duration, cancel: Option<&CancellationToken>) -> Result<()> {
+    match cancel {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => bail!(TURN_CANCELLED_MSG),
+                _ = tokio::time::sleep(delay) => {}
+            }
+            Ok(())
+        }
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
+    }
 }
 
 fn truncate_err(s: &str, max: usize) -> String {
@@ -502,6 +665,71 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_prints_the_api_key() {
+        const FAKE_KEY: &str = "xai-dm-debug-SECRET-0987654321";
+        let client = DmClient::with_model(FAKE_KEY, "grok-test");
+        let out = format!("{client:?}");
+        assert!(!out.contains(FAKE_KEY), "debug leaked key: {out}");
+        assert!(out.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_is_redacted_before_display() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const FAKE_KEY: &str = "xai-error-body-SECRET-123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "invalid api_key={FAKE_KEY} Authorization: Bearer sk-fake-token-12345"
+            )))
+            .mount(&server)
+            .await;
+
+        let client = DmClient::with_model("test-key", "grok-test").with_base_url(server.uri());
+        let mut state = GameState::new("Hero");
+        let err = client
+            .query("sys", "look", &mut state, &ChatHistory::new(0))
+            .await
+            .expect_err("400 should fail");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(FAKE_KEY), "error leaked key: {msg}");
+        assert!(
+            !msg.contains("sk-fake-token-12345"),
+            "error leaked key: {msg}"
+        );
+        assert!(msg.contains("[REDACTED]"), "error was not redacted: {msg}");
+    }
+
+    #[tokio::test]
+    async fn oversized_chat_body_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = "x".repeat(MAX_CHAT_BODY_BYTES + 1);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = DmClient::with_model("test-key", "grok-test").with_base_url(server.uri());
+        let mut state = GameState::new("Hero");
+        let err = client
+            .query("sys", "look", &mut state, &ChatHistory::new(0))
+            .await
+            .expect_err("oversized body should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large") || msg.contains("exceeds"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn completion_body_pins_model_and_reasoning_effort() {
         let body = completion_body("grok-4.7", "low", &[], &json!([]), 0.7);
         assert_eq!(body["model"], "grok-4.7");
@@ -524,15 +752,19 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            requests: 2,
         };
         a.add(&UsageTotals {
             prompt_tokens: 3,
             completion_tokens: 2,
             total_tokens: 5,
+            requests: 1,
         });
         assert_eq!(a.prompt_tokens, 13);
         assert_eq!(a.completion_tokens, 7);
         assert_eq!(a.total_tokens, 20);
+        assert_eq!(a.requests, 3);
+        assert_eq!(UsageTotals::default().requests, 0);
     }
 
     #[test]

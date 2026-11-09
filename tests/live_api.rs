@@ -21,7 +21,7 @@ async fn one_dm_turn_smoke() {
     let result = client
         .query(
             &system,
-            "Begin the adventure. Describe where LiveTester wakes up. Keep it to one short paragraph.",
+            "Begin the adventure for LiveTester. Open on a specific inciting incident with immediate pressure, call move_to_room to set the location, and end with a first choice. Keep it to one short paragraph.",
             &mut state,
             &history,
         )

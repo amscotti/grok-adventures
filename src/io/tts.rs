@@ -1,15 +1,21 @@
 //! xAI text-to-speech client (`POST /v1/tts`).
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::io::audio::{ActivePlayback, play_mp3_bytes, play_mp3_bytes_cancellable};
-use crate::util::http::api_client;
+use crate::util::http::{api_client, read_body_bounded, read_text_bounded};
+use crate::util::redact::redact_secrets;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Hard cap on one TTS audio body (20 MiB).
+const MAX_TTS_AUDIO_BYTES: usize = 20 * 1024 * 1024;
+/// Hard cap on a TTS error body (64 KiB).
+const MAX_TTS_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// xAI TTS text length limit (chars).
 pub const MAX_TTS_CHARS: usize = 15_000;
 
@@ -138,11 +144,21 @@ pub fn build_tts_request_body(text: &str, voice_id: &str, language: &str) -> Val
 }
 
 /// HTTP client for xAI TTS.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TtsClient {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+impl fmt::Debug for TtsClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TtsClient")
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl TtsClient {
@@ -180,15 +196,17 @@ impl TtsClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
-            bail!("TTS API error {status}: {err_body}");
+            let err_body = read_text_bounded(resp, MAX_TTS_ERROR_BODY_BYTES, "TTS error").await?;
+            bail!("TTS API error {status}: {}", redact_secrets(&err_body));
         }
 
-        let bytes = resp.bytes().await.context("reading TTS audio body")?;
+        let bytes = read_body_bounded(resp, MAX_TTS_AUDIO_BYTES, "TTS audio")
+            .await
+            .context("reading TTS audio body")?;
         if bytes.is_empty() {
             bail!("TTS API returned empty audio body");
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Synthesize and play via local player (single request).
@@ -423,5 +441,64 @@ mod tests {
         // "Dr.Strange" stays one segment; "Dr. " would split.
         let parts = split_sentences("See Dr.Strange now. Go.");
         assert_eq!(parts, vec!["See Dr.Strange now.", "Go."]);
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        const FAKE_KEY: &str = "xai-tts-debug-SECRET-1122334455";
+        let client = TtsClient::new(FAKE_KEY);
+        let out = format!("{client:?}");
+        assert!(!out.contains(FAKE_KEY), "debug leaked key: {out}");
+        assert!(out.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn tts_error_body_is_redacted() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const FAKE_KEY: &str = "xai-tts-error-SECRET-5566778899";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tts"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(format!("bad token api_key={FAKE_KEY}")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TtsClient::new("test-key").with_base_url(server.uri());
+        let err = client
+            .synthesize("hello", "voice")
+            .await
+            .expect_err("401 should fail");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(FAKE_KEY), "error leaked key: {msg}");
+        assert!(msg.contains("[REDACTED]"), "error was not redacted: {msg}");
+    }
+
+    #[tokio::test]
+    async fn tts_error_body_is_capped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = "e".repeat(MAX_TTS_ERROR_BODY_BYTES + 1);
+        Mock::given(method("POST"))
+            .and(path("/tts"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = TtsClient::new("test-key").with_base_url(server.uri());
+        let err = client
+            .synthesize("hello", "voice")
+            .await
+            .expect_err("oversized error body should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large") || msg.contains("exceeds"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -43,7 +43,8 @@ impl fmt::Display for RollResult {
 ///
 /// Examples: 10→0, 12→+1, 8→-1, 7→-2.
 pub fn ability_modifier(score: i32) -> i32 {
-    (score - 10).div_euclid(2)
+    // Widen before subtracting so i32::MIN/MAX scores cannot overflow.
+    ((i64::from(score) - 10).div_euclid(2)) as i32
 }
 
 /// Roll `count` dice of `sides` faces, then add `modifier` to the sum.
@@ -61,7 +62,7 @@ pub fn roll(sides: u32, count: u32, modifier: i32) -> Result<RollResult, DiceErr
     let mut rng = rand::rng();
     let rolls: Vec<u32> = (0..count).map(|_| rng.random_range(1..=sides)).collect();
     let sum: i32 = rolls.iter().map(|&r| r as i32).sum();
-    let total = sum + modifier;
+    let total = sum.saturating_add(modifier);
 
     Ok(RollResult {
         rolls,
@@ -133,6 +134,21 @@ mod tests {
         assert_eq!(ability_modifier(1), -5);
         assert_eq!(ability_modifier(20), 5);
         assert_eq!(ability_modifier(0), -5);
+    }
+
+    #[test]
+    fn ability_modifier_extremes_do_not_overflow() {
+        assert_eq!(ability_modifier(i32::MAX), 1_073_741_818);
+        assert_eq!(ability_modifier(i32::MIN), -1_073_741_829);
+    }
+
+    #[test]
+    fn roll_saturates_huge_modifiers() {
+        let high = roll(20, 10, i32::MAX).unwrap();
+        assert_eq!(high.total, i32::MAX);
+        let low = roll(20, 10, i32::MIN).unwrap();
+        let sum: i32 = low.rolls.iter().map(|&r| r as i32).sum();
+        assert_eq!(low.total, i32::MIN.saturating_add(sum));
     }
 
     #[test]

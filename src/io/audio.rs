@@ -20,16 +20,26 @@ pub fn clamp_record_seconds(requested: u32, max_secs: u32) -> u32 {
 
 /// Write mono signed 16-bit PCM samples as a WAV file.
 ///
-/// Pure helper — no audio hardware required.
+/// Pure helper — no audio hardware required. On Unix the file is created
+/// with `0o600` permissions; a partially written file is removed on failure.
 pub fn write_wav_i16(path: impl AsRef<Path>, sample_rate: u32, samples: &[i16]) -> Result<()> {
     let path = path.as_ref();
+    let result = write_wav_i16_inner(path, sample_rate, samples);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn write_wav_i16_inner(path: &Path, sample_rate: u32, samples: &[i16]) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)
+    let file = create_owner_only_file(path)?;
+    let mut writer = hound::WavWriter::new(file, spec)
         .with_context(|| format!("creating WAV {}", path.display()))?;
     for &s in samples {
         writer
@@ -40,6 +50,23 @@ pub fn write_wav_i16(path: impl AsRef<Path>, sample_rate: u32, samples: &[i16]) 
         .finalize()
         .with_context(|| format!("finalizing WAV {}", path.display()))?;
     Ok(())
+}
+
+/// Create (or truncate) a file readable and writable only by the owner on Unix.
+///
+/// Capture/TTS payloads are private user audio; keep them out of reach of
+/// other local users even while the file briefly sits in the temp directory.
+fn create_owner_only_file(path: &Path) -> Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 /// Resolve a temp path for a new WAV capture.
@@ -414,6 +441,10 @@ struct PlaybackInner {
     killed: AtomicBool,
 }
 
+/// How often [`PlaybackHandle::wait`] checks for child exit without holding
+/// the child mutex. Keeps [`PlaybackHandle::kill`] responsive.
+const PLAYBACK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 impl PlaybackHandle {
     fn new(child: std::process::Child, temp_path: Option<PathBuf>) -> Self {
         Self {
@@ -431,11 +462,18 @@ impl PlaybackHandle {
     }
 
     /// Stop playback immediately (best-effort). Safe to call more than once.
+    ///
+    /// Takes the child out under a short lock, then kills/reaps it outside the
+    /// lock so a concurrent [`wait`](Self::wait) can never block cancellation.
     pub fn kill(&self) {
         self.inner.killed.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.inner.child.lock()
-            && let Some(mut child) = guard.take()
-        {
+        let child = self
+            .inner
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -443,19 +481,32 @@ impl PlaybackHandle {
     }
 
     /// Block until the player exits. Signal-killed / cancelled exits are `Ok`.
+    ///
+    /// Polls `try_wait` under a short lock and sleeps outside it, so
+    /// [`kill`](Self::kill) can take the child at any point.
     pub fn wait(&self) -> Result<()> {
-        let status = {
+        let status = loop {
             let mut guard = self.inner.child.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_mut() {
-                Some(child) => {
-                    let status = child.wait().context("waiting for audio player")?;
+            let Some(child) = guard.as_mut() else {
+                // Taken by `kill` (or already reaped by a prior wait).
+                drop(guard);
+                self.cleanup_temp();
+                return Ok(());
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
                     *guard = None;
-                    status
+                    break status;
                 }
-                None => {
-                    // Already reaped (killed or prior wait).
+                Ok(None) => {
+                    drop(guard);
+                    thread::sleep(PLAYBACK_POLL_INTERVAL);
+                }
+                Err(err) => {
+                    *guard = None;
+                    drop(guard);
                     self.cleanup_temp();
-                    return Ok(());
+                    return Err(err).context("waiting for audio player");
                 }
             }
         };
@@ -503,9 +554,12 @@ impl ActivePlayback {
     /// Kill any in-flight playback and mark the stream cancelled.
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.current.lock()
-            && let Some(handle) = guard.take()
-        {
+        let handle = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle {
             handle.kill();
         }
     }
@@ -522,11 +576,13 @@ impl ActivePlayback {
 
     /// Register `handle` as the active playback (stops any previous).
     pub fn set(&self, handle: PlaybackHandle) {
-        if let Ok(mut guard) = self.current.lock() {
-            if let Some(prev) = guard.take() {
-                prev.kill();
-            }
-            *guard = Some(handle);
+        let prev = if let Ok(mut guard) = self.current.lock() {
+            guard.replace(handle)
+        } else {
+            None
+        };
+        if let Some(prev) = prev {
+            prev.kill();
         }
     }
 
@@ -611,13 +667,9 @@ pub fn play_mp3_bytes(bytes: &[u8]) -> Result<()> {
 /// The temp file is removed when the handle is waited on or killed.
 pub fn play_mp3_bytes_cancellable(bytes: &[u8]) -> Result<PlaybackHandle> {
     let path = temp_mp3_path();
-    {
-        let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer
-            .write_all(bytes)
-            .with_context(|| format!("writing {}", path.display()))?;
-        writer.flush()?;
+    if let Err(err) = write_temp_mp3(&path, bytes) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
     }
     let child = match spawn_player(&path) {
         Ok(c) => c,
@@ -627,6 +679,19 @@ pub fn play_mp3_bytes_cancellable(bytes: &[u8]) -> Result<PlaybackHandle> {
         }
     };
     Ok(PlaybackHandle::new(child, Some(path)))
+}
+
+/// Write TTS bytes to a private temp file (owner-only on Unix).
+fn write_temp_mp3(path: &Path, bytes: &[u8]) -> Result<()> {
+    let file = create_owner_only_file(path)?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flushing {}", path.display()))?;
+    Ok(())
 }
 
 /// Optional damage click from `assets/sounds/*.{wav,mp3}` via afplay (macOS).
@@ -811,5 +876,96 @@ mod tests {
         // Already-stopped flag means the poll loop exits immediately *after*
         // stream setup; we only assert the flag semantics here (no mic in CI).
         assert!(stop2.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    fn spawn_sleep(secs: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg(secs)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_returns_promptly_while_wait_is_blocked() {
+        let handle = PlaybackHandle::new(spawn_sleep("5"), None);
+        let waiter = {
+            let handle = handle.clone();
+            thread::spawn(move || handle.wait())
+        };
+        // Give the waiter time to enter its try_wait loop.
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        handle.kill();
+        let kill_elapsed = started.elapsed();
+        assert!(
+            kill_elapsed < Duration::from_millis(500),
+            "kill blocked for {kill_elapsed:?}"
+        );
+
+        let wait_started = Instant::now();
+        let result = waiter.join().expect("waiter thread panicked");
+        let wait_elapsed = wait_started.elapsed();
+        assert!(result.is_ok(), "wait returned {result:?}");
+        assert!(
+            wait_elapsed < Duration::from_secs(2),
+            "wait kept blocking for {wait_elapsed:?} after kill"
+        );
+        assert!(handle.was_killed());
+        eprintln!("kill returned in {kill_elapsed:?}; waiter exited in {wait_elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_removes_temp_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("clip.mp3");
+        std::fs::write(&path, b"audio").unwrap();
+        let handle = PlaybackHandle::new(spawn_sleep("5"), Some(path.clone()));
+
+        handle.kill();
+
+        assert!(!path.exists(), "temp file survived kill");
+        assert!(handle.was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_removes_temp_file_after_natural_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("clip.mp3");
+        std::fs::write(&path, b"audio").unwrap();
+        let child = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let handle = PlaybackHandle::new(child, Some(path.clone()));
+
+        handle.wait().unwrap();
+
+        assert!(!path.exists(), "temp file survived a normal wait");
+        assert!(!handle.was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_audio_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mp3 = dir.path().join("clip.mp3");
+        write_temp_mp3(&mp3, b"audio").unwrap();
+        let wav = dir.path().join("clip.wav");
+        write_wav_i16(&wav, 16_000, &[0, 1, -1]).unwrap();
+
+        for path in [&mp3, &wav] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} is not owner-only", path.display());
+        }
     }
 }

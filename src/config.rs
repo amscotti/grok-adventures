@@ -1,5 +1,6 @@
 //! Configuration loaded from `config.toml` + environment.
 
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -30,7 +31,6 @@ pub struct Config {
     pub ui: UiConfig,
     pub voice: VoiceConfig,
     pub game: GameConfig,
-    pub tts: TtsConfig,
     pub stt: SttConfig,
 }
 
@@ -100,7 +100,7 @@ fn env_override(slot: &mut String, key: &str) {
 }
 
 /// xAI API credentials and model selection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct XaiConfig {
     pub api_key: String,
@@ -110,6 +110,17 @@ pub struct XaiConfig {
     pub player_model: String,
     /// `low` | `medium` | `high` | `xhigh`. Sent as `reasoning_effort`.
     pub reasoning_effort: String,
+}
+
+impl fmt::Debug for XaiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XaiConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("player_model", &self.player_model)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .finish()
+    }
 }
 
 impl Default for XaiConfig {
@@ -154,7 +165,6 @@ pub struct VoiceConfig {
     pub stt_edit_before_send: bool,
     pub enable_tts: bool,
     pub dm_voice: String,
-    pub narrator_voice: String,
 }
 
 impl Default for VoiceConfig {
@@ -164,17 +174,15 @@ impl Default for VoiceConfig {
             stt_edit_before_send: true,
             enable_tts: true,
             dm_voice: "zagan".to_string(),
-            narrator_voice: "orion".to_string(),
         }
     }
 }
 
-/// Game tone / ruleset.
+/// Game tone and chat-history depth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameConfig {
     pub tone: String,
-    pub ruleset: String,
     /// Prior DM exchanges kept as chat messages (user + assistant final text).
     /// `0` = no multi-turn history (state + log only, legacy behavior).
     pub history_turns: u32,
@@ -184,23 +192,7 @@ impl Default for GameConfig {
     fn default() -> Self {
         Self {
             tone: "heroic".to_string(),
-            ruleset: "dnd5e".to_string(),
             history_turns: 8,
-        }
-    }
-}
-
-/// TTS output format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TtsConfig {
-    pub format: String,
-}
-
-impl Default for TtsConfig {
-    fn default() -> Self {
-        Self {
-            format: "mp3".to_string(),
         }
     }
 }
@@ -311,9 +303,62 @@ tone = "comedic"
         assert_eq!(cfg.ui.theme, "grokday");
         assert!(!cfg.ui.compact);
         assert_eq!(cfg.game.tone, "comedic");
-        assert_eq!(cfg.game.ruleset, "dnd5e");
+        assert_eq!(cfg.game.history_turns, 8);
         assert_eq!(cfg.voice.dm_voice, "zagan");
-        assert_eq!(cfg.tts.format, "mp3");
+    }
+
+    #[test]
+    fn removed_and_unknown_keys_are_ignored() {
+        // Old config files may still contain keys this build no longer reads.
+        // Serde ignores unknown fields by default; loading must keep working.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[game]
+tone = "dark_fantasy"
+ruleset = "dnd5e"
+
+[voice]
+enable_tts = false
+narrator_voice = "orion"
+
+[tts]
+format = "wav"
+
+[unknown]
+future_option = true
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(file.path()).expect("legacy config parses");
+        assert_eq!(cfg.game.tone, "dark_fantasy");
+        assert_eq!(cfg.game.history_turns, 8);
+        assert!(!cfg.voice.enable_tts);
+        assert_eq!(cfg.voice.dm_voice, "zagan");
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        const FAKE_KEY: &str = "xai-config-debug-SECRET-1234567890";
+        let cfg = Config {
+            xai: XaiConfig {
+                api_key: FAKE_KEY.to_string(),
+                ..XaiConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let whole = format!("{cfg:?}");
+        let xai = format!("{:?}", cfg.xai);
+        assert!(
+            !whole.contains(FAKE_KEY),
+            "config debug leaked key: {whole}"
+        );
+        assert!(!xai.contains(FAKE_KEY), "xai debug leaked key: {xai}");
+        assert!(whole.contains("<redacted>"));
+        assert!(xai.contains("<redacted>"));
     }
 
     #[test]
@@ -323,7 +368,7 @@ tone = "comedic"
         if root.exists() {
             let cfg = Config::load(&root).expect("project config");
             assert!(matches!(cfg.ui.mode, UiMode::Minimal | UiMode::Fullscreen));
-            assert!(!cfg.game.ruleset.is_empty());
+            assert!(!cfg.game.tone.is_empty());
         }
     }
 }

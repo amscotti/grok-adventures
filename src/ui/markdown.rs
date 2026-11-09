@@ -1,12 +1,18 @@
 //! Minimal inline markdown rendering for DM narration.
 
+use crate::ui::sanitize;
 use crate::ui::theme;
 
 /// Convert a minimal subset of inline markdown to ANSI.
 ///
 /// Currently supports `**bold**`. When `NO_COLOR` is set, bold markers are
 /// stripped and plain text is returned.
+///
+/// The input is sanitized before scanning so escape sequences cannot smuggle
+/// terminal controls into the styled output (the ANSI codes added here are the
+/// only ones emitted).
 pub fn render_inline(text: &str) -> String {
+    let text = sanitize::sanitize_terminal_text(text);
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -43,6 +49,7 @@ pub fn render_inline(text: &str) -> String {
 /// Shared by the fullscreen TUI (which applies its own ratatui styles) so it
 /// does not duplicate the `**` scan in `render_inline`.
 pub fn strip_inline(text: &str) -> String {
+    let text = sanitize::sanitize_terminal_text(text);
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -69,7 +76,12 @@ pub fn strip_inline(text: &str) -> String {
 /// only when there is room; for tiny `max` just takes the first chars so
 /// the result never exceeds `max`.
 pub fn truncate_chars(s: &str, max: usize) -> String {
-    let cleaned: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    // Summaries are terminal-facing too; sanitize before counting so escape
+    // bytes cannot consume the visible width or leak through.
+    let cleaned: String = sanitize::sanitize_terminal_text(s)
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .collect();
     if cleaned.chars().count() <= max {
         cleaned
     } else if max <= 3 {
@@ -131,5 +143,45 @@ mod tests {
         // Tiny max: no ellipsis overflow.
         assert_eq!(truncate_chars("abcde", 2), "ab");
         assert_eq!(truncate_chars("abcde", 0), "");
+    }
+
+    #[test]
+    fn hostile_escape_payloads_never_reach_output() {
+        let hostile = "\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J\u{202e}";
+
+        // `render_inline` legitimately adds SGR bold codes, but no hostile
+        // introducers or payload may survive around them.
+        let styled = render_inline(&format!("a **bold** {hostile}"));
+        assert!(!styled.contains("\x1b]"), "OSC survived: {styled:?}");
+        assert!(!styled.contains("\x1b[2J"), "CSI survived: {styled:?}");
+        assert!(!styled.contains('\x07'), "BEL survived: {styled:?}");
+        assert!(!styled.contains('\u{202e}'), "bidi survived: {styled:?}");
+        assert!(styled.contains("bold"));
+
+        for rendered in [
+            strip_inline(&format!("a **bold** {hostile}")),
+            truncate_chars(&format!("a {hostile}"), 80),
+        ] {
+            assert!(!rendered.contains('\u{1b}'), "ESC survived: {rendered:?}");
+            assert!(!rendered.contains('\x07'), "BEL survived: {rendered:?}");
+            assert!(
+                !rendered.contains('\u{202e}'),
+                "bidi survived: {rendered:?}"
+            );
+            assert!(rendered.contains('a'));
+        }
+    }
+
+    #[test]
+    fn bold_still_styles_after_sanitizing() {
+        let rendered = strip_inline("A **dark** hall.");
+        assert_eq!(rendered, "A dark hall.");
+        let styled = render_inline("A **dark** hall.");
+        let plain = if theme::colors_enabled() {
+            styled.replace("\x1b[1m", "").replace("\x1b[22m", "")
+        } else {
+            styled
+        };
+        assert_eq!(plain, "A dark hall.");
     }
 }

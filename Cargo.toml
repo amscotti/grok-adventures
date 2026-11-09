@@ -2,8 +2,11 @@
 name = "grok_adventures"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 description = "CLI dungeon master — Grok narrates, Rust keeps score"
 license = "MIT"
+repository = "https://github.com/amscotti/grok-adventures"
+homepage = "https://github.com/amscotti/grok-adventures"
 readme = "README.md"
 default-run = "grok-adventures"
 

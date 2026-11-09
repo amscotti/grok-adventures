@@ -17,6 +17,7 @@ use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 
 use crate::game::state::{CLASS_KITS, ClassKit, GameState, class_kit};
+use crate::ui::sanitize;
 use crate::ui::theme;
 
 /// Row index of the "No class" entry (after every kit).
@@ -27,6 +28,9 @@ pub const ROW_COUNT: usize = CLASS_KITS.len() + 1;
 const NO_CLASS_TAGLINE: &str = "Start unaffiliated";
 const NO_CLASS_BLURB: &str = "No kit, no commitments. The dungeon will teach you.";
 const NO_CLASS_BEST_FOR: &str = "Improvising, letting the story decide";
+const NO_CLASS_SIGNATURE: &str = "none — no training/kit";
+/// Word-wrap width for picker detail text (keeps 40-column terminals readable).
+const DETAIL_WRAP: usize = 36;
 
 /// Highlight state for the class picker (pure, unit-testable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +122,7 @@ pub fn parse_class_flag(value: &str) -> Result<Option<&'static ClassKit>, String
         TypedChoice::Skip if !value.trim().is_empty() => Ok(None),
         _ => Err(format!(
             "invalid --class '{}' (expected fighter|rogue|wizard|cleric|none)",
-            value.trim()
+            sanitize::sanitize_terminal_line(value.trim())
         )),
     }
 }
@@ -132,6 +136,46 @@ enum LineKind {
     Row { selected: bool },
     DetailTitle,
     Detail,
+}
+
+/// Wrap plain words to at most `width` characters per line.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let projected =
+            current.chars().count() + usize::from(!current.is_empty()) + word.chars().count();
+        if !current.is_empty() && projected > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// `Signature: Name` plus wrapped effect, padded to four stable picker rows.
+fn signature_detail_lines(signature: &str) -> Vec<String> {
+    let (name, effect) = signature.split_once(" — ").unwrap_or((signature, ""));
+    let mut lines = vec![format!("  Signature: {name}")];
+    for line in wrap_words(effect, DETAIL_WRAP).into_iter().take(3) {
+        lines.push(format!("  {line}"));
+    }
+    // Always four rows so the picker height does not jump between classes.
+    lines.resize(4, String::new());
+    // A trailing empty string is dropped by `str::lines()`; keep the row
+    // present (visually blank) so rendered-height checks and redraws agree.
+    if let Some(last) = lines.last_mut()
+        && last.is_empty()
+    {
+        *last = " ".to_string();
+    }
+    lines
 }
 
 /// Plain-text picker lines. Line count is identical for every selection,
@@ -167,24 +211,29 @@ fn picker_lines(picker: &ClassPicker) -> Vec<(String, LineKind)> {
     ));
     lines.push((String::new(), LineKind::Blank));
 
-    let (title, hp_stats, starts, best) = match picker.selected_kit() {
+    let (title, hp_stats, starts, best, feature) = match picker.selected_kit() {
         Some(kit) => (
             format!("  {} — {}", kit.display, kit.blurb),
             format!("  HP {} · {}", kit.max_hp, kit.stats_line()),
             format!("  Starts with: {} — {}", kit.item, kit.item_desc),
             format!("  Best for: {}", kit.best_for),
+            signature_detail_lines(kit.signature),
         ),
         None => (
             format!("  No class — {NO_CLASS_BLURB}"),
             "  HP 20 · STR 10 · DEX 10 · CON 10 · INT 10 · WIS 10 · CHA 10".to_string(),
             "  Starts with: —".to_string(),
             format!("  Best for: {NO_CLASS_BEST_FOR}"),
+            signature_detail_lines(NO_CLASS_SIGNATURE),
         ),
     };
     lines.push((title, LineKind::DetailTitle));
     lines.push((hp_stats, LineKind::Detail));
     lines.push((starts, LineKind::Detail));
     lines.push((best, LineKind::Detail));
+    for line in feature {
+        lines.push((line, LineKind::Detail));
+    }
     lines
 }
 
@@ -215,7 +264,7 @@ pub fn render_typed_menu() -> String {
     let mut out = String::from("Choose a class:\n");
     for (i, kit) in CLASS_KITS.iter().enumerate() {
         out.push_str(&format!(
-            "{}  ) {} — {}\n    {}\n    HP {} · {}\n    Starts with: {} — {}\n",
+            "{}  ) {} — {}\n    {}\n    HP {} · {}\n    Starts with: {} — {}\n    Signature: {}\n",
             i + 1,
             kit.display,
             kit.tagline,
@@ -223,11 +272,12 @@ pub fn render_typed_menu() -> String {
             kit.max_hp,
             kit.stats_line(),
             kit.item,
-            kit.item_desc
+            kit.item_desc,
+            kit.signature
         ));
     }
     out.push_str(&format!(
-        "0  ) No class — {NO_CLASS_TAGLINE}\n    {NO_CLASS_BLURB}\n    HP 20 · all stats 10"
+        "0  ) No class — {NO_CLASS_TAGLINE}\n    {NO_CLASS_BLURB}\n    HP 20 · all stats 10\n    Signature: {NO_CLASS_SIGNATURE}"
     ));
     out
 }
@@ -242,27 +292,46 @@ pub fn summary_line(state: &GameState) -> String {
 }
 
 /// Multi-line confirmation card printed after creation (plain text).
+///
+/// Display-only: every player/save-supplied field is sanitized here, so the
+/// stored name, class, and item names stay untouched.
 pub fn format_character_summary(state: &GameState) -> String {
+    character_summary_lines(state).join("\n")
+}
+
+/// Sanitized lines for the confirmation card (one display field per line).
+pub fn character_summary_lines(state: &GameState) -> Vec<String> {
     let items = if state.inventory.is_empty() {
         "—".to_string()
     } else {
-        state
-            .inventory
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        sanitize::sanitize_terminal_line(
+            &state
+                .inventory
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     };
-    let class = state.class.as_deref().unwrap_or("No class");
-    format!(
-        "✦ {} · {}\n  HP {}/{} · {}\n  Starts with: {}",
-        state.character_name,
-        class,
-        state.hp,
-        state.max_hp,
-        state.stats_string(),
-        items
-    )
+    let class = sanitize::sanitize_terminal_line(state.class.as_deref().unwrap_or("No class"));
+    let mut lines = vec![
+        format!(
+            "✦ {} · {}",
+            sanitize::sanitize_terminal_line(&state.character_name),
+            class
+        ),
+        format!(
+            "  HP {}/{} · {}",
+            state.hp,
+            state.max_hp,
+            state.stats_string()
+        ),
+        format!("  Starts with: {items}"),
+    ];
+    if let Some(kit) = state.class.as_deref().and_then(class_kit) {
+        lines.push(format!("  Class feature: {}", kit.signature));
+    }
+    lines
 }
 
 /// Whether prompts may read from the keyboard (stdin is a terminal).
@@ -337,16 +406,18 @@ fn run_typed_picker() -> Result<Option<&'static ClassKit>> {
             TypedChoice::Class(kit) => return Ok(Some(kit)),
             TypedChoice::Skip => return Ok(None),
             TypedChoice::Invalid => {
-                println!(
-                    "{}",
-                    theme::dim(&format!(
-                        "Didn't catch '{}' — enter 1-4, a class name, or Enter to skip.",
-                        line.trim()
-                    ))
-                );
+                println!("{}", theme::dim(&invalid_class_notice(&line)));
             }
         }
     }
+}
+
+/// Sanitized "didn't catch that" notice for a typed class answer.
+fn invalid_class_notice(input: &str) -> String {
+    format!(
+        "Didn't catch '{}' — enter 1-4, a class name, or Enter to skip.",
+        sanitize::sanitize_terminal_line(input.trim())
+    )
 }
 
 /// RAII: restore cooked mode + cursor when the raw picker exits.
@@ -571,8 +642,22 @@ mod tests {
             assert!(menu.contains(kit.display));
             assert!(menu.contains(kit.blurb));
             assert!(menu.contains(kit.item));
+            assert!(menu.contains(kit.signature));
         }
         assert!(menu.contains("No class"));
+    }
+
+    #[test]
+    fn picker_shows_signature_detail_without_changing_height() {
+        let mut picker = ClassPicker::new();
+        let mut heights = Vec::new();
+        for row in 0..ROW_COUNT {
+            picker.select_row(row);
+            let rendered = render_picker(&picker, false);
+            assert!(rendered.contains("Signature:"), "row {row}: {rendered}");
+            heights.push(rendered.lines().count());
+        }
+        assert!(heights.iter().all(|h| *h == heights[0]), "{heights:?}");
     }
 
     #[test]
@@ -587,5 +672,53 @@ mod tests {
 
         let plain = GameState::new("Nobody");
         assert!(format_character_summary(&plain).contains("No class"));
+    }
+
+    #[test]
+    fn character_summary_sanitizes_hostile_display_fields() {
+        let hostile_name = "Mira\x1b]52;c;cGF5bG9hZA==\x07\u{202e}";
+        let mut state = GameState::new(hostile_name);
+        state.class = Some("Wizard\u{9d}0;spoof\u{9c}".into());
+        state.add_item("Dagger\x1b[2J\x07", "blade", 1);
+
+        let lines = character_summary_lines(&state);
+        assert_eq!(lines.len(), 3);
+        let card = format_character_summary(&state);
+        assert!(card.contains("Mira"));
+        assert!(card.contains("Wizard"));
+        assert!(card.contains("Dagger"));
+        for control in ['\u{1b}', '\u{7}', '\u{202e}', '\u{9b}', '\u{9d}', '\u{9c}'] {
+            assert!(
+                !card.contains(control),
+                "summary leaked {control:?}: {card:?}"
+            );
+        }
+        assert!(!card.contains("52;"));
+
+        // Display sanitization must not mutate the stored fields.
+        assert_eq!(state.character_name, hostile_name);
+        assert_eq!(state.class.as_deref(), Some("Wizard\u{9d}0;spoof\u{9c}"));
+    }
+
+    #[test]
+    fn typed_class_notice_sanitizes_answer() {
+        let notice = invalid_class_notice("bard\x1b]52;c;AAAA\x07\u{202e}\nspoof");
+        assert!(notice.contains("bard"));
+        for control in ['\u{1b}', '\u{7}', '\u{202e}'] {
+            assert!(
+                !notice.contains(control),
+                "notice leaked {control:?}: {notice:?}"
+            );
+        }
+        assert!(!notice.contains('\n'));
+    }
+
+    #[test]
+    fn class_flag_error_sanitizes_hostile_value() {
+        let err = parse_class_flag("bard\x1b]52;c;AAAA\x07\u{202e}").unwrap_err();
+        assert!(err.contains("bard"));
+        for control in ['\u{1b}', '\u{7}', '\u{202e}'] {
+            assert!(!err.contains(control), "error leaked {control:?}: {err:?}");
+        }
     }
 }

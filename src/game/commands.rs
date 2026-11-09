@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use regex::Regex;
 
+use crate::dm::UsageTotals;
 use crate::game::save::SaveGame;
 use crate::game::state::GameState;
 use crate::ui::blocks::{self, Block, SystemKind};
@@ -18,11 +19,74 @@ use crate::ui::blocks::{self, Block, SystemKind};
 pub enum MetaResult {
     Quit,
     Handled,
+    /// A save was loaded successfully; callers must reset per-session context.
+    Loaded,
     /// Start push-to-talk recording (optional override seconds).
     Talk {
         seconds: Option<u32>,
     },
+    /// `/usage` — the interactive loop renders its own session accumulator.
+    Usage,
     NotMeta,
+}
+
+/// Token usage accumulated over one interactive session.
+///
+/// Not persisted in saves: it tracks what this process has billed so far.
+/// `requests` counts chat-completion round trips across every tool hop, so a
+/// single turn can be several requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub turns: u32,
+    pub requests: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+impl SessionUsage {
+    /// Add one successful DM turn. The client already aggregates tool hops, so
+    /// this adds tokens and requests for the whole turn at once. A local
+    /// resume recap (no API call) is not counted as a turn.
+    pub fn record_turn(&mut self, usage: &UsageTotals) {
+        self.prompt_tokens += usage.prompt_tokens;
+        self.completion_tokens += usage.completion_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.requests += usage.requests;
+        if usage.requests > 0 {
+            self.turns += 1;
+        }
+    }
+}
+
+/// Render `/usage` output. No rates are hardcoded: xAI sets prices and can
+/// change them independently of this build.
+pub fn format_session_usage(usage: &SessionUsage) -> String {
+    if usage.requests == 0 {
+        return "No API calls yet.".to_string();
+    }
+    format!(
+        "Session usage\n\
+         Turns: {}\n\
+         API requests: {}\n\
+         Prompt tokens: {}\n\
+         Completion tokens: {}\n\
+         Total tokens: {}\n\
+         Rates are set by xAI; see README for what bills.",
+        usage.turns,
+        usage.requests,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens
+    )
+}
+
+/// `/usage` response block shared by the minimal and fullscreen loops.
+pub fn session_usage_block(usage: &SessionUsage) -> Block {
+    Block::System {
+        text: format_session_usage(usage),
+        kind: SystemKind::Info,
+    }
 }
 
 /// Mutable per-session UI / voice flags.
@@ -168,6 +232,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Repeat your last action",
     },
     SlashCommand {
+        name: "usage",
+        aliases: &["cost"],
+        args: "",
+        description: "Show session token usage",
+    },
+    SlashCommand {
         name: "clear",
         aliases: &["cls"],
         args: "",
@@ -249,11 +319,31 @@ pub fn handle_meta_command(
     if !is_slash && !known {
         return Ok((MetaResult::NotMeta, vec![]));
     }
+    if is_slash && !known {
+        // Unknown slash commands stay local: never bill the DM for a typo.
+        let label = if cmd.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{cmd}")
+        };
+        return Ok((
+            MetaResult::Handled,
+            vec![Block::System {
+                text: format!("Unknown command `{label}` — /help"),
+                kind: SystemKind::Error,
+            }],
+        ));
+    }
     // Bare words that are multi-word natural language should not match if
-    // the original had more than the command — except save/load/talk/long with args.
+    // the original had more than the command. `save`, `load`, and `talk`
+    // accept arguments only in slash form; `long rest` and `tools …` keep
+    // their bare multi-word behavior.
     if !is_slash {
         let words: Vec<&str> = input.split_whitespace().collect();
-        let arg_cmds = ["save", "load", "tools", "talk", "long"];
+        if words.len() > 1 && matches!(cmd.as_str(), "save" | "load" | "talk") {
+            return Ok((MetaResult::NotMeta, vec![]));
+        }
+        let arg_cmds = ["tools", "long"];
         if words.len() > 1 && !arg_cmds.contains(&cmd.as_str()) {
             return Ok((MetaResult::NotMeta, vec![]));
         }
@@ -327,20 +417,33 @@ pub fn handle_meta_command(
         }
         "load" => {
             let path = SaveGame::resolve_path(arg.as_deref());
-            let blocks = match SaveGame::load(&path) {
+            match SaveGame::load(&path) {
                 Ok(loaded) => {
                     state.replace_with(loaded);
-                    vec![Block::System {
-                        text: format!("Loaded game from {path}"),
+                    let mut blocks = vec![Block::System {
+                        text: format!(
+                            "Loaded game from {path} — {} (HP {}/{})",
+                            state.character_name, state.hp, state.max_hp
+                        ),
                         kind: SystemKind::Success,
-                    }]
+                    }];
+                    if let Some(narration) = state.last_narration.clone() {
+                        blocks.push(Block::System {
+                            text: "Previously…".into(),
+                            kind: SystemKind::Info,
+                        });
+                        blocks.push(Block::Dm { text: narration });
+                    }
+                    Ok((MetaResult::Loaded, blocks))
                 }
-                Err(e) => vec![Block::System {
-                    text: format!("Load failed: {e:#}"),
-                    kind: SystemKind::Error,
-                }],
-            };
-            Ok((MetaResult::Handled, blocks))
+                Err(e) => Ok((
+                    MetaResult::Handled,
+                    vec![Block::System {
+                        text: format!("Load failed: {e:#}"),
+                        kind: SystemKind::Error,
+                    }],
+                )),
+            }
         }
         "clear" | "cls" => {
             // Minimal mode: clear terminal scrollback. Fullscreen ignores this
@@ -409,8 +512,11 @@ pub fn handle_meta_command(
             let seconds = arg.as_ref().and_then(|a| a.parse::<u32>().ok());
             Ok((MetaResult::Talk { seconds }, vec![]))
         }
-        // /copy and /again are handled by the interactive loops (need last DM /
-        // history). Acknowledge if they slip through handle_meta_command alone.
+        // /usage and /again are handled by the interactive loops (need the
+        // session accumulator / last DM / history). /usage only signals the
+        // loop; /again acknowledges if it slips through alone. Neither may
+        // reach the DM.
+        "usage" | "cost" => Ok((MetaResult::Usage, vec![])),
         "copy" => Ok((
             MetaResult::Handled,
             vec![Block::System {
@@ -426,6 +532,22 @@ pub fn handle_meta_command(
             }],
         )),
         _ => Ok((MetaResult::NotMeta, vec![])),
+    }
+}
+
+/// Gate for actions that start a DM or STT turn.
+///
+/// Returns an explanatory block when the character is dead. Dead characters
+/// keep `/resurrect`, `/load`, `/quit`, and the other meta/help commands;
+/// `/again` and `/talk` (and any new action) are refused.
+pub fn ensure_alive(state: &GameState) -> Option<Block> {
+    if state.alive() {
+        None
+    } else {
+        Some(Block::System {
+            text: "You have fallen. Type /resurrect to continue testing, or /quit to end.".into(),
+            kind: SystemKind::Info,
+        })
     }
 }
 
@@ -456,18 +578,26 @@ pub fn handle_state_query_blocks(state: &GameState, input: &str) -> Option<Vec<B
 }
 
 /// Map HP to a descriptive condition label (pure, testable).
+///
+/// Dead means `hp <= 0`; a positive HP value never maps to "dead", even in a
+/// crafted save with `max_hp <= 0` or HP above the maximum.
 pub fn health_condition(hp: i32, max_hp: i32) -> &'static str {
-    if max_hp <= 0 {
+    if hp <= 0 {
         return "dead";
     }
-    let pct = (hp as f64 / max_hp as f64 * 100.0) as i32;
-    match pct {
-        100 => "in perfect health",
-        75..=99 => "slightly wounded",
-        50..=74 => "wounded",
-        25..=49 => "badly wounded",
-        1..=24 => "near death",
-        _ => "dead",
+    if max_hp <= 0 || hp >= max_hp {
+        return "in perfect health";
+    }
+    let hp = i64::from(hp);
+    let max_hp = i64::from(max_hp);
+    if hp * 100 >= max_hp * 75 {
+        "slightly wounded"
+    } else if hp * 100 >= max_hp * 50 {
+        "wounded"
+    } else if hp * 100 >= max_hp * 25 {
+        "badly wounded"
+    } else {
+        "near death"
     }
 }
 
@@ -622,6 +752,7 @@ System Commands
 /talk [max seconds] — Record mic until Enter (or max); transcribe an action
 /copy — Copy last DM narration to clipboard (OSC 52; also cache/last-copy.txt)
 /again — Repeat your last action
+/usage or /cost — Show session token usage (no API call)
 /debug — Show complete game state
 /quit or exit — End the game
 /help — Show this help
@@ -764,9 +895,10 @@ mod tests {
     fn meta_unknown_and_bare_word_guards() {
         let mut state = GameState::new("Hero");
         let mut flags = test_flags();
-        // Unknown slash command is explicitly not meta.
-        let (r, _) = handle_meta_command(&mut state, "/frobnicate", &mut flags).unwrap();
-        assert_eq!(r, MetaResult::NotMeta);
+        // Unknown slash commands are handled locally (never billed).
+        let (r, blocks) = handle_meta_command(&mut state, "/frobnicate", &mut flags).unwrap();
+        assert_eq!(r, MetaResult::Handled);
+        assert!(system_block_text(&blocks).contains("Unknown command `/frobnicate`"));
         // Unknown bare word is not meta.
         let (r, _) = handle_meta_command(&mut state, "frobnicate", &mut flags).unwrap();
         assert_eq!(r, MetaResult::NotMeta);
@@ -778,14 +910,79 @@ mod tests {
         // ... but slash form always counts.
         let (r, _) = handle_meta_command(&mut state, "/stats foo", &mut flags).unwrap();
         assert_eq!(r, MetaResult::Handled);
-        // Arg-commands accept bare multi-word form (save into a tempdir).
+        // Slash-form save accepts an argument (into a tempdir).
         let dir = tempfile::TempDir::new().unwrap();
         let slot = dir.path().join("slot.json");
         let slot_str = slot.to_str().unwrap().to_string();
         let (r, _) =
-            handle_meta_command(&mut state, &format!("save {slot_str}"), &mut flags).unwrap();
+            handle_meta_command(&mut state, &format!("/save {slot_str}"), &mut flags).unwrap();
         assert_eq!(r, MetaResult::Handled);
         assert!(slot.exists());
+    }
+
+    #[test]
+    fn bare_arg_keywords_are_natural_language_but_slash_forms_are_meta() {
+        let mut state = GameState::new("Hero");
+        let mut flags = test_flags();
+        for input in ["talk to the guard", "save the village", "load the wagon"] {
+            let (r, _) = handle_meta_command(&mut state, input, &mut flags).unwrap();
+            assert_eq!(r, MetaResult::NotMeta, "input: {input}");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = dir.path().join("slot.json");
+        let save_input = format!("/save {}", slot.to_str().unwrap());
+        let load_input = format!("/load {}", slot.to_str().unwrap());
+        for input in [String::from("/talk 8"), save_input, load_input] {
+            let (r, _) = handle_meta_command(&mut state, &input, &mut flags).unwrap();
+            assert_ne!(r, MetaResult::NotMeta, "input: {input}");
+        }
+        for input in ["load", "talk"] {
+            let (r, _) = handle_meta_command(&mut state, input, &mut flags).unwrap();
+            assert_ne!(r, MetaResult::NotMeta, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn unknown_slash_commands_never_fall_through() {
+        let mut state = GameState::new("Hero");
+        let mut flags = test_flags();
+        for input in ["/health", "/hlep", "/frobnicate now"] {
+            let (r, blocks) = handle_meta_command(&mut state, input, &mut flags).unwrap();
+            assert_eq!(r, MetaResult::Handled, "input: {input}");
+            let text = system_block_text(&blocks);
+            assert!(text.contains("Unknown command"), "input: {input}: {text}");
+            assert!(text.contains("/help"), "input: {input}: {text}");
+        }
+    }
+
+    #[test]
+    fn load_success_signals_reset_and_announces_character() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("loaded.json");
+        let mut saved = GameState::new("Aria");
+        saved.hp = 12;
+        saved.set_last_narration("The bridge burned behind you.");
+        SaveGame::save(&saved, &path).unwrap();
+
+        let mut state = GameState::new("Old Hero");
+        let mut flags = test_flags();
+        let (r, blocks) = handle_meta_command(
+            &mut state,
+            &format!("/load {}", path.to_str().unwrap()),
+            &mut flags,
+        )
+        .unwrap();
+        assert_eq!(r, MetaResult::Loaded);
+        assert_eq!(state.character_name, "Aria");
+        assert_eq!(state.hp, 12);
+        let system = system_block_text(&blocks);
+        assert!(system.contains("Aria") && system.contains("HP 12/20"));
+        assert!(system.contains("Previously"));
+        assert!(
+            blocks.iter().any(
+                |b| matches!(b, Block::Dm { text } if text == "The bridge burned behind you.")
+            )
+        );
     }
 
     #[test]
@@ -892,6 +1089,79 @@ mod tests {
     }
 
     #[test]
+    fn session_usage_zero_state_reports_no_calls() {
+        let usage = SessionUsage::default();
+        assert_eq!(usage.turns, 0);
+        assert_eq!(usage.requests, 0);
+        assert_eq!(format_session_usage(&usage), "No API calls yet.");
+        assert_eq!(
+            system_block_text(std::slice::from_ref(&session_usage_block(&usage))),
+            "No API calls yet."
+        );
+        // A local resume recap has no API call and is not a turn.
+        let mut resumed = SessionUsage::default();
+        resumed.record_turn(&UsageTotals::default());
+        assert_eq!(resumed, SessionUsage::default());
+        assert_eq!(format_session_usage(&resumed), "No API calls yet.");
+    }
+
+    #[test]
+    fn session_usage_accumulates_opening_and_turns_with_tool_hops() {
+        let mut usage = SessionUsage::default();
+        // Opening turn: two chat requests (one tool hop + final narration).
+        usage.record_turn(&UsageTotals {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            requests: 2,
+        });
+        usage.record_turn(&UsageTotals {
+            prompt_tokens: 40,
+            completion_tokens: 10,
+            total_tokens: 50,
+            requests: 1,
+        });
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.requests, 3);
+        assert_eq!(usage.prompt_tokens, 140);
+        assert_eq!(usage.completion_tokens, 30);
+        assert_eq!(usage.total_tokens, 170);
+
+        let text = format_session_usage(&usage);
+        assert!(text.contains("Turns: 2"), "{text}");
+        assert!(text.contains("API requests: 3"), "{text}");
+        assert!(text.contains("Prompt tokens: 140"), "{text}");
+        assert!(text.contains("Completion tokens: 30"), "{text}");
+        assert!(text.contains("Total tokens: 170"), "{text}");
+        assert!(text.contains("Rates are set by xAI; see README"), "{text}");
+        assert!(!text.contains('$'), "no hardcoded dollar rates: {text}");
+
+        // The loops render the same block.
+        let block_text = system_block_text(std::slice::from_ref(&session_usage_block(&usage)));
+        assert_eq!(block_text, text);
+    }
+
+    #[test]
+    fn meta_usage_is_local_and_never_falls_through() {
+        let mut state = GameState::new("Hero");
+        let mut flags = test_flags();
+        // Slash forms (even with junk args) and one-word bare forms are local.
+        for input in ["/usage", "/cost", "/usage extra", "usage", "cost"] {
+            let (r, blocks) = handle_meta_command(&mut state, input, &mut flags).unwrap();
+            assert_eq!(r, MetaResult::Usage, "input: {input}");
+            assert!(blocks.is_empty(), "input: {input}");
+        }
+        // Bare multi-word input stays natural language for the DM.
+        for input in ["usage extra", "cost of the sword"] {
+            let (r, _) = handle_meta_command(&mut state, input, &mut flags).unwrap();
+            assert_eq!(r, MetaResult::NotMeta, "input: {input}");
+        }
+        // Help lists the command.
+        let (_, blocks) = handle_meta_command(&mut state, "/help", &mut flags).unwrap();
+        assert!(state_block_text(&blocks).contains("/usage or /cost"));
+    }
+
+    #[test]
     fn meta_long_bare_word_is_not_meta_but_slash_hints() {
         let mut state = GameState::new("Hero");
         let mut flags = test_flags();
@@ -913,7 +1183,10 @@ mod tests {
         let mut flags = test_flags();
         let (r, _) = handle_meta_command(&mut state, "/talk banana", &mut flags).unwrap();
         assert_eq!(r, MetaResult::Talk { seconds: None });
+        // Bare `talk` with anything after it is natural language now.
         let (r, _) = handle_meta_command(&mut state, "talk 12 extra", &mut flags).unwrap();
+        assert_eq!(r, MetaResult::NotMeta);
+        let (r, _) = handle_meta_command(&mut state, "/talk 12 extra", &mut flags).unwrap();
         assert_eq!(r, MetaResult::Talk { seconds: None });
     }
 
@@ -936,12 +1209,48 @@ mod tests {
     }
 
     #[test]
+    fn load_failure_keeps_existing_session_context() {
+        let mut state = GameState::new("Hero");
+        state.set_last_narration("The old tale continues.");
+        let mut flags = test_flags();
+        let (r, blocks) = handle_meta_command(
+            &mut state,
+            "/load /definitely/not/here/either.json",
+            &mut flags,
+        )
+        .unwrap();
+        assert_eq!(r, MetaResult::Handled, "failed load is not a reset signal");
+        assert_eq!(state.character_name, "Hero");
+        assert_eq!(
+            state.last_narration.as_deref(),
+            Some("The old tale continues.")
+        );
+        assert!(system_block_text(&blocks).contains("Load failed"));
+    }
+
+    #[test]
+    fn ensure_alive_gates_actions_not_meta() {
+        let mut state = GameState::new("Hero");
+        assert!(ensure_alive(&state).is_none());
+        state.hp = 0;
+        let gate = ensure_alive(&state).expect("dead state is gated");
+        assert!(system_block_text(std::slice::from_ref(&gate)).contains("/resurrect"));
+        // Meta commands remain available while dead.
+        let mut flags = test_flags();
+        for cmd in ["/resurrect", "/help", "/load /definitely/not/here.json"] {
+            let (r, _) = handle_meta_command(&mut state, cmd, &mut flags).unwrap();
+            assert_ne!(r, MetaResult::NotMeta, "cmd: {cmd}");
+        }
+        assert_eq!(state.hp, 1, "/resurrect still works while dead");
+    }
+
+    #[test]
     fn meta_load_missing_file_is_error_block() {
         let mut state = GameState::new("Hero");
         let mut flags = test_flags();
         let (r, blocks) = handle_meta_command(
             &mut state,
-            "load /definitely/not/here/nope.json",
+            "/load /definitely/not/here/nope.json",
             &mut flags,
         )
         .unwrap();
@@ -957,7 +1266,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let dir_str = dir.path().to_str().unwrap().to_string();
         let (r, blocks) =
-            handle_meta_command(&mut state, &format!("save {dir_str}"), &mut flags).unwrap();
+            handle_meta_command(&mut state, &format!("/save {dir_str}"), &mut flags).unwrap();
         assert_eq!(r, MetaResult::Handled);
         assert!(system_block_text(&blocks).contains("Save failed"));
     }
@@ -975,9 +1284,22 @@ mod tests {
         assert_eq!(health_condition(1, 100), "near death");
         assert_eq!(health_condition(0, 100), "dead");
         assert_eq!(health_condition(-5, 100), "dead");
-        assert_eq!(health_condition(10, 0), "dead");
-        assert_eq!(health_condition(10, -4), "dead");
-        assert_eq!(health_condition(150, 100), "dead");
+        // A positive HP value means alive, even in a crafted save.
+        assert_eq!(health_condition(10, 0), "in perfect health");
+        assert_eq!(health_condition(10, -4), "in perfect health");
+        assert_eq!(health_condition(150, 100), "in perfect health");
+    }
+
+    #[test]
+    fn health_condition_never_contradicts_alive() {
+        for hp in [1, 5, 20, 99, 150, i32::MAX] {
+            for max_hp in [0, -4, 1, 20, 100] {
+                let condition = health_condition(hp, max_hp);
+                assert_ne!(condition, "dead", "hp={hp}, max_hp={max_hp}");
+            }
+        }
+        assert_eq!(health_condition(1, 1_000_000), "near death");
+        assert_eq!(health_condition(i32::MAX, 1), "in perfect health");
     }
 
     #[test]

@@ -11,7 +11,12 @@
 /cache/
 *.mp3
 *.wav
+# Committed SFX are allowed; generated/temp audio above stays ignored.
+!assets/sounds/**
 /tmp/
+
+# Local working notes (not part of the project)
+/TODO.md
 
 # OS / editor
 .DS_Store

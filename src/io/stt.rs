@@ -1,5 +1,6 @@
 //! xAI speech-to-text client (`POST /v1/stt`).
 
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -7,10 +8,13 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::DEFAULT_STT_MODEL;
-use crate::util::http::api_client;
+use crate::util::http::{api_client, read_text_bounded};
+use crate::util::redact::redact_secrets;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Hard cap on one STT response body (2 MiB).
+const MAX_STT_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// JSON response from `/v1/stt`.
 #[derive(Debug, Clone, Deserialize)]
@@ -21,7 +25,7 @@ pub struct SttResponse {
 }
 
 /// HTTP client for xAI STT.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SttClient {
     client: reqwest::Client,
     api_key: String,
@@ -29,6 +33,19 @@ pub struct SttClient {
     model: String,
     language: String,
     streaming: bool,
+}
+
+impl fmt::Debug for SttClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SttClient")
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
 }
 
 impl SttClient {
@@ -139,13 +156,15 @@ impl SttClient {
             .context("sending STT request")?;
 
         let status = resp.status();
-        let body = resp.text().await.context("reading STT response body")?;
+        let body = read_text_bounded(resp, MAX_STT_BODY_BYTES, "STT")
+            .await
+            .context("reading STT response body")?;
         if !status.is_success() {
-            bail!("STT API error {status}: {body}");
+            bail!("STT API error {status}: {}", redact_secrets(&body));
         }
 
-        let parsed: SttResponse =
-            serde_json::from_str(&body).with_context(|| format!("parsing STT JSON: {body}"))?;
+        let parsed: SttResponse = serde_json::from_str(&body)
+            .with_context(|| format!("parsing STT JSON: {}", redact_secrets(&body)))?;
         Ok(parsed.text.trim().to_string())
     }
 }
@@ -192,5 +211,73 @@ mod tests {
         let r: SttResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(r.text, "hi");
         assert!(r.duration.is_none());
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        const FAKE_KEY: &str = "xai-stt-debug-SECRET-9988776655";
+        let client = SttClient::new(FAKE_KEY);
+        let out = format!("{client:?}");
+        assert!(!out.contains(FAKE_KEY), "debug leaked key: {out}");
+        assert!(out.contains("<redacted>"));
+    }
+
+    fn temp_wav() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"fake wav bytes").unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn stt_error_body_is_redacted() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const FAKE_KEY: &str = "xai-stt-error-SECRET-13572468";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/stt"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(format!("bad token Bearer {FAKE_KEY}")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = SttClient::new("test-key").with_base_url(server.uri());
+        let wav = temp_wav();
+        let err = client
+            .transcribe_wav(wav.path())
+            .await
+            .expect_err("401 should fail");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(FAKE_KEY), "error leaked key: {msg}");
+        assert!(msg.contains("[REDACTED]"), "error was not redacted: {msg}");
+    }
+
+    #[tokio::test]
+    async fn stt_body_is_capped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = "x".repeat(MAX_STT_BODY_BYTES + 1);
+        Mock::given(method("POST"))
+            .and(path("/stt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = SttClient::new("test-key").with_base_url(server.uri());
+        let wav = temp_wav();
+        let err = client
+            .transcribe_wav(wav.path())
+            .await
+            .expect_err("oversized body should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large") || msg.contains("exceeds"),
+            "unexpected error: {msg}"
+        );
     }
 }

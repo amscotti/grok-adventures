@@ -1,5 +1,8 @@
 //! Input buffer for the fullscreen prompt (cursor-aware line editing).
 
+use crate::ui::sanitize;
+use crate::ui::status;
+
 /// Editable prompt line with a character-index cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prompt {
@@ -39,9 +42,10 @@ impl Prompt {
             .unwrap_or(self.input.len())
     }
 
-    /// Insert a character at the cursor (ignores control chars).
+    /// Insert a character at the cursor (ignores control and invisible
+    /// formatting characters).
     pub fn insert_char(&mut self, c: char) {
-        if c.is_control() {
+        if c.is_control() || sanitize::is_disallowed_terminal_char(c) {
             return;
         }
         let idx = self.byte_index_at(self.cursor);
@@ -49,11 +53,26 @@ impl Prompt {
         self.cursor += 1;
     }
 
-    /// Insert a string of printable text at the cursor.
+    /// Insert pasted text at the cursor.
+    ///
+    /// The paste is sanitized as a whole first so escape sequences cannot
+    /// smuggle their payload in as plain text. This is a one-line prompt, so
+    /// newlines/tabs (which the sanitizer otherwise preserves) are dropped,
+    /// matching the previous behaviour of [`Self::insert_char`].
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            self.insert_char(c);
+        for c in sanitize::sanitize_terminal_text(s).chars() {
+            if !c.is_control() {
+                self.insert_char(c);
+            }
         }
+    }
+
+    /// Insert clipboard text as one editable line.
+    ///
+    /// Clipboard line breaks and tabs are flattened to single spaces before
+    /// [`Self::insert_str`] sanitizes the result; pasting never submits.
+    pub fn insert_paste(&mut self, s: &str) {
+        self.insert_str(&normalize_paste(s));
     }
 
     /// Delete the character before the cursor, if any.
@@ -160,11 +179,145 @@ impl Prompt {
         self.input.truncate(start);
     }
 
-    /// Display width of text before the cursor (ASCII = 1 per char).
-    /// Used for terminal cursor placement; non-ASCII counts as one cell each.
+    /// Display width of text before the cursor (CJK/emoji count as their
+    /// terminal cells, not one column per scalar value).
+    /// Used for terminal cursor placement.
+    ///
+    /// Counts the sanitized prefix so control/escape characters that are
+    /// stripped at render time do not shift the cursor off its glyph.
     pub fn cursor_display_cols(&self) -> u16 {
-        self.cursor.min(u16::MAX as usize) as u16
+        let prefix: String = self.input.chars().take(self.cursor).collect();
+        let sanitized = sanitize::sanitize_terminal_line(&prefix);
+        status::display_width(&sanitized).min(u16::MAX as usize) as u16
     }
+
+    /// Char index of the cursor inside the *sanitized* body text.
+    ///
+    /// `cursor()` indexes the raw buffer; sanitization can remove characters,
+    /// so display code maps through the sanitized prefix instead.
+    pub fn sanitized_cursor_char_index(&self) -> usize {
+        let prefix: String = self.input.chars().take(self.cursor).collect();
+        sanitize::sanitize_terminal_line(&prefix).chars().count()
+    }
+}
+
+/// Flatten clipboard line breaks and tabs into single spaces.
+///
+/// `\r\n`, lone `\r`, `\n`, and `\t` each become one space so a multi-line
+/// paste stays one editable prompt line. Other control/escape sequences are
+/// left for [`sanitize::sanitize_terminal_text`] to remove.
+pub fn normalize_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                // Treat CRLF as one break, not two spaces.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(' ');
+            }
+            '\n' | '\t' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A width-bounded view of the composer body with the cursor located inside
+/// it. `text` may start with `…` when the left side was clipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerWindow {
+    pub text: String,
+    /// Display columns from the start of [`Self::text`] to the cursor.
+    pub cursor_col: usize,
+    pub clipped_left: bool,
+}
+
+/// Choose a visible window of `text` that keeps the cursor on screen.
+///
+/// `cursor_char` is a char index into `text`; `width` is the number of cells
+/// available for the body (the `› ` prefix is accounted for by the caller).
+/// Long text is clipped on the left with a leading `…`; near the end of the
+/// buffer the window ends at the cursor, otherwise it keeps the cursor roughly
+/// centered so both sides stay editable.
+pub fn composer_window(text: &str, cursor_char: usize, width: usize) -> ComposerWindow {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor_char = cursor_char.min(chars.len());
+    let cursor_display = char_slice_width(&chars[..cursor_char]);
+    let total = char_slice_width(&chars);
+
+    if width == 0 {
+        return ComposerWindow {
+            text: String::new(),
+            cursor_col: 0,
+            clipped_left: total > 0,
+        };
+    }
+    if total <= width {
+        return ComposerWindow {
+            text: text.to_string(),
+            cursor_col: cursor_display,
+            clipped_left: false,
+        };
+    }
+
+    // Keep the cursor near the middle, but slide the window to end at the
+    // cursor when there is little or no text after it.
+    let half = width / 2;
+    let after = total.saturating_sub(cursor_display);
+    let start_target = if after < half {
+        cursor_display.saturating_sub(width.saturating_sub(1))
+    } else {
+        cursor_display.saturating_sub(half)
+    };
+
+    let clipped_left = start_target > 0;
+    let ellipsis = usize::from(clipped_left);
+    let budget = width.saturating_sub(ellipsis);
+
+    // First char at/after the requested start column.
+    let mut start_idx = chars.len();
+    let mut acc = 0usize;
+    for (i, &ch) in chars.iter().enumerate() {
+        if acc >= start_target {
+            start_idx = i;
+            break;
+        }
+        acc += status::display_width(ch.encode_utf8(&mut [0u8; 4]));
+    }
+
+    let start_display = char_slice_width(&chars[..start_idx]);
+    let mut visible = String::new();
+    let mut visible_width = 0usize;
+    for &ch in &chars[start_idx..] {
+        let w = status::display_width(ch.encode_utf8(&mut [0u8; 4]));
+        if visible_width + w > budget {
+            break;
+        }
+        visible.push(ch);
+        visible_width += w;
+    }
+
+    let mut out = String::new();
+    if clipped_left {
+        out.push('…');
+    }
+    out.push_str(&visible);
+
+    ComposerWindow {
+        text: out,
+        cursor_col: ellipsis + cursor_display.saturating_sub(start_display),
+        clipped_left,
+    }
+}
+
+fn char_slice_width(chars: &[char]) -> usize {
+    chars
+        .iter()
+        .map(|&c| status::display_width(c.encode_utf8(&mut [0u8; 4])))
+        .sum()
 }
 
 /// Ring of previously submitted prompt lines (oldest first).
@@ -376,6 +529,129 @@ mod tests {
         p.insert_char('\t');
         p.insert_char('a');
         assert_eq!(p.input(), "a");
+    }
+
+    #[test]
+    fn insert_rejects_bidi_and_zero_width() {
+        let mut p = Prompt::new();
+        for c in [
+            '\u{202e}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200b}', '\u{feff}',
+        ] {
+            p.insert_char(c);
+        }
+        p.insert_char('a');
+        assert_eq!(p.input(), "a");
+        assert_eq!(p.cursor(), 1);
+    }
+
+    #[test]
+    fn paste_is_sanitized_as_a_whole() {
+        let mut p = Prompt::new();
+        p.insert_str("look\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J\u{202e}\u{2067} around");
+        assert_eq!(p.input(), "look around");
+        assert_eq!(p.cursor(), "look around".chars().count());
+        assert!(!p.input().contains('\u{1b}'));
+        assert!(!p.input().contains('\x07'));
+        assert!(!p.input().contains('\u{202e}'));
+        assert!(!p.input().contains('\u{2067}'));
+    }
+
+    #[test]
+    fn paste_normalizes_line_breaks_and_tabs() {
+        assert_eq!(
+            normalize_paste("look\r\naround\rhere\nnow\tplease"),
+            "look around here now please"
+        );
+        let mut p = Prompt::new();
+        p.insert_paste("look\r\naround\rhere\nnow\tplease");
+        assert_eq!(p.input(), "look around here now please");
+        assert_eq!(p.cursor(), "look around here now please".chars().count());
+    }
+
+    #[test]
+    fn paste_sanitizes_controls_after_normalizing() {
+        let mut p = Prompt::new();
+        p.insert_paste("look\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J\u{202e}\taround");
+        assert_eq!(p.input(), "look around");
+        assert!(!p.input().contains('\u{1b}'));
+        assert!(!p.input().contains('\x07'));
+        assert!(!p.input().contains('\u{202e}'));
+    }
+
+    #[test]
+    fn paste_inserts_at_the_cursor() {
+        let mut p = Prompt::new();
+        p.insert_str("look");
+        p.move_home();
+        p.move_right();
+        p.move_right();
+        p.insert_paste("!\n");
+        assert_eq!(p.input(), "lo! ok");
+        assert_eq!(p.cursor(), 4);
+    }
+
+    #[test]
+    fn cursor_columns_ignore_stripped_escape_text() {
+        let mut p = Prompt::new();
+        p.set("a\x1b[2Jb");
+        assert_eq!(p.cursor_display_cols(), 2);
+        assert_eq!(p.sanitized_cursor_char_index(), 2);
+        p.move_home();
+        p.move_right();
+        assert_eq!(p.cursor_display_cols(), 1);
+    }
+
+    #[test]
+    fn cursor_columns_count_display_cells_for_cjk() {
+        let mut p = Prompt::new();
+        p.set("龍龍");
+        assert_eq!(p.cursor_display_cols(), 4);
+        p.move_home();
+        p.move_right();
+        assert_eq!(p.cursor_display_cols(), 2);
+    }
+
+    #[test]
+    fn composer_window_keeps_short_text_whole() {
+        let window = composer_window("look around", 4, 40);
+        assert_eq!(window.text, "look around");
+        assert_eq!(window.cursor_col, 4);
+        assert!(!window.clipped_left);
+    }
+
+    #[test]
+    fn composer_window_shows_long_ascii_tail() {
+        let text = format!("{}TAIL-MARKER", "walk north and search ".repeat(8));
+        let cursor = text.chars().count();
+        let window = composer_window(&text, cursor, 40);
+        assert!(window.clipped_left);
+        assert!(window.text.starts_with('…'));
+        assert!(window.text.ends_with("TAIL-MARKER"));
+        assert!(status::display_width(&window.text) <= 40);
+        assert_eq!(window.cursor_col, status::display_width(&window.text));
+    }
+
+    #[test]
+    fn composer_window_places_cursor_after_cjk_glyphs() {
+        let text = "龍".repeat(20);
+        let window = composer_window(&text, 20, 36);
+        assert!(window.clipped_left);
+        assert!(window.text.starts_with('…'));
+        assert_eq!(window.text.chars().filter(|c| *c == '龍').count(), 17);
+        assert!(status::display_width(&window.text) <= 36);
+        // 20 CJK glyphs are 40 cells. The cursor must land after the visible
+        // glyphs (~35), not 20 cells early from counting chars.
+        assert_eq!(window.cursor_col, 35);
+        assert!(window.cursor_col > 20);
+    }
+
+    #[test]
+    fn composer_window_cursor_stays_visible_mid_text() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let window = composer_window(text, 20, 10);
+        assert!(window.cursor_col < 10);
+        let before: String = window.text.chars().take(window.cursor_col).collect();
+        assert_eq!(status::display_width(&before), window.cursor_col);
     }
 
     #[test]

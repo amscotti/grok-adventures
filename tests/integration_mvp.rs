@@ -21,6 +21,7 @@ fn save_load_preserves_full_state() {
     state.add_companion("Pip", "fairy");
     state.add_journal_entry("The lagoon is cursed");
     state.log("Player: search the altar");
+    state.set_last_narration("The altar hums under your hand.");
 
     SaveGame::save(&state, &path).expect("save");
     let loaded = SaveGame::load(&path).expect("load");
@@ -33,6 +34,10 @@ fn save_load_preserves_full_state() {
     assert!(loaded.find_companion("Pip").is_some());
     assert!(loaded.journal.iter().any(|j| j == "The lagoon is cursed"));
     assert!(loaded.visited("Crypt"));
+    assert_eq!(
+        loaded.last_narration.as_deref(),
+        Some("The altar hums under your hand.")
+    );
     assert!(loaded.invariant_violations().is_empty());
 }
 

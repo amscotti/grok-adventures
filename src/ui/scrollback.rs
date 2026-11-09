@@ -2,6 +2,11 @@
 
 use crate::ui::blocks::Block;
 
+/// Maximum retained transcript blocks. Oldest entries are dropped first so a
+/// long session cannot grow the scrollback (and its per-frame wrapping cost)
+/// without bound.
+pub const MAX_ENTRIES: usize = 2_000;
+
 /// One entry in the fullscreen scrollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptEntry {
@@ -21,18 +26,27 @@ impl Scrollback {
         Self::default()
     }
 
-    /// Append a block and pin view to the bottom.
+    /// Append a block and pin view to the bottom. Drops the oldest block when
+    /// the transcript exceeds [`MAX_ENTRIES`].
     pub fn push(&mut self, block: Block) {
         self.entries.push(TranscriptEntry { block });
+        self.trim();
         self.scroll = 0;
     }
 
     /// Append many blocks.
     pub fn extend(&mut self, blocks: impl IntoIterator<Item = Block>) {
-        for b in blocks {
-            self.entries.push(TranscriptEntry { block: b });
-        }
+        self.entries
+            .extend(blocks.into_iter().map(|block| TranscriptEntry { block }));
+        self.trim();
         self.scroll = 0;
+    }
+
+    fn trim(&mut self) {
+        if self.entries.len() > MAX_ENTRIES {
+            let excess = self.entries.len() - MAX_ENTRIES;
+            self.entries.drain(0..excess);
+        }
     }
 
     pub fn entries(&self) -> &[TranscriptEntry] {
@@ -118,6 +132,36 @@ mod tests {
         sb.scroll_down(1);
         assert_eq!(sb.scroll(), 2);
         sb.scroll_down(10);
+        assert_eq!(sb.scroll(), 0);
+    }
+
+    #[test]
+    fn caps_oldest_blocks() {
+        let mut sb = Scrollback::new();
+        for i in 0..MAX_ENTRIES + 5 {
+            sb.push(Block::Dm {
+                text: format!("line {i}"),
+            });
+        }
+        assert_eq!(sb.len(), MAX_ENTRIES);
+        assert!(matches!(
+            &sb.entries()[0].block,
+            Block::Dm { text } if text == "line 5"
+        ));
+        assert!(matches!(
+            &sb.entries()[MAX_ENTRIES - 1].block,
+            Block::Dm { text } if text == &format!("line {}", MAX_ENTRIES + 4)
+        ));
+
+        // Extend obeys the same cap.
+        sb.extend((0..10).map(|i| Block::Dm {
+            text: format!("ext {i}"),
+        }));
+        assert_eq!(sb.len(), MAX_ENTRIES);
+        assert!(matches!(
+            &sb.entries()[MAX_ENTRIES - 1].block,
+            Block::Dm { text } if text == "ext 9"
+        ));
         assert_eq!(sb.scroll(), 0);
     }
 }
